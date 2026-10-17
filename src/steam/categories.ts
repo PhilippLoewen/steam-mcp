@@ -1,13 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { getSteamDir, getUserConfig } from './paths.js';
+import { randomInt } from 'node:crypto';
+import { getSteamDir, getUserConfig, isSteamRunning } from './paths.js';
 
 /**
  * Library categories ("user collections") as stored by the Steam client in
  * userdata/<accountid>/config/cloudstorage/cloud-storage-namespace-1.json.
  *
- * That file is a cloud-synced cache owned by the Steam client: this module
- * only ever reads it.
+ * That file is a cloud-synced cache owned by the Steam client. Edits are only
+ * written while Steam is closed: the changed key is listed in
+ * cloud-storage-namespace-1.modified.json so Steam uploads it on its next start.
  */
 
 const KEY_PREFIX = 'user-collections.';
@@ -154,9 +156,306 @@ export function findCategoriesFile(): string | null {
   return null;
 }
 
-/** Read categories from disk (read-only). Returns null when no file exists. */
+/** Read categories from disk. Returns null when no file exists. */
 export function readCategories(includeDeleted = false): Category[] | null {
   const file = findCategoriesFile();
   if (!file) return null;
   return parseCategories(fs.readFileSync(file, 'utf-8'), includeDeleted);
+}
+
+// ---------------------------------------------------------------------------
+// Editing
+// ---------------------------------------------------------------------------
+
+/** An edit refused for a reason the caller should show as-is. */
+export class CategoryError extends Error {}
+
+export interface CategoryEdit {
+  /** New file text; identical to the input when nothing changed. */
+  raw: string;
+  key: string;
+  changed: boolean;
+}
+
+export interface MembershipEdit extends CategoryEdit {
+  /** Appids actually added or removed. */
+  affected: number[];
+  /** Appids that were already members (add) or not members (remove). */
+  skipped: number[];
+}
+
+type Pair = [string, Record<string, unknown>];
+
+/** Favorites and Hidden have fixed ids and can't be renamed or deleted. */
+const SPECIAL: Record<string, { id: string; name: string }> = {
+  favorite: { id: 'favorite', name: 'Favorites' },
+  favorites: { id: 'favorite', name: 'Favorites' },
+  hidden: { id: 'hidden', name: 'Hidden' },
+};
+const SPECIAL_KEYS = new Set([`${KEY_PREFIX}favorite`, `${KEY_PREFIX}hidden`]);
+
+const ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function randomCollectionId(): string {
+  let id = '';
+  for (let i = 0; i < 12; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)];
+  return id;
+}
+
+/** Strict counterpart of parseCategories: a file we can't parse must not be rewritten. */
+function loadPairs(raw: string): Pair[] {
+  let top: unknown;
+  try {
+    top = JSON.parse(raw);
+  } catch {
+    throw new CategoryError('cloud-storage-namespace-1.json is not valid JSON; nothing was changed');
+  }
+  if (!Array.isArray(top)) {
+    throw new CategoryError('cloud-storage-namespace-1.json is not a JSON array; nothing was changed');
+  }
+  return top as Pair[];
+}
+
+function pairIndex(pairs: Pair[], key: string): number {
+  return pairs.findIndex((p) => Array.isArray(p) && p[0] === key);
+}
+
+function newEntry(key: string, value: object, now: number): Record<string, unknown> {
+  return {
+    key,
+    timestamp: now,
+    value: JSON.stringify(value),
+    conflictResolutionMethod: 'custom',
+    strMethodId: 'union-collections',
+  };
+}
+
+function resolveCategory(raw: string, query: string): Category {
+  const categories = parseCategories(raw);
+  const category = findCategory(categories, query);
+  if (!category) {
+    throw new CategoryError(
+      `Category "${query}" not found. Available: ${categories.map((c) => c.name).join(', ') || '(none)'}`,
+    );
+  }
+  return category;
+}
+
+function assertNameFree(raw: string, name: string, exceptKey?: string): void {
+  const lower = name.toLowerCase();
+  if (SPECIAL[lower]) throw new CategoryError(`"${name}" is reserved for the built-in collection`);
+  const clash = parseCategories(raw).find((c) => c.key !== exceptKey && c.name.toLowerCase() === lower);
+  if (clash) throw new CategoryError(`A category named "${clash.name}" already exists`);
+}
+
+function assertNotSpecial(category: Category, verb: string): void {
+  if (SPECIAL_KEYS.has(category.key)) {
+    throw new CategoryError(`"${category.name}" is a built-in collection and can't be ${verb}`);
+  }
+}
+
+function cleanName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) throw new CategoryError('Category name must not be empty');
+  return trimmed;
+}
+
+/**
+ * Apply `mutate` to the parsed value of the category's entry and bump its
+ * timestamp. Every other field and entry is kept as-is.
+ */
+function updateValue(
+  raw: string,
+  key: string,
+  now: number,
+  mutate: (value: Record<string, unknown>) => void,
+): CategoryEdit {
+  const pairs = loadPairs(raw);
+  const meta = pairs[pairIndex(pairs, key)][1];
+  const before = meta['value'];
+  if (typeof before !== 'string') throw new CategoryError(`Entry ${key} has no value to edit`);
+  const value = JSON.parse(before) as Record<string, unknown>;
+  mutate(value);
+  const after = JSON.stringify(value);
+  if (after === before) return { raw, key, changed: false };
+  meta['value'] = after;
+  meta['timestamp'] = now;
+  return { raw: JSON.stringify(pairs), key, changed: true };
+}
+
+function editMembership(
+  raw: string,
+  query: string,
+  appids: number[],
+  now: number,
+  mode: 'add' | 'remove',
+): MembershipEdit {
+  const category = resolveCategory(raw, query);
+  if (category.hasFilter) {
+    throw new CategoryError(
+      `"${category.name}" is a dynamic collection; its games come from filters and can't be ${mode === 'add' ? 'added' : 'removed'} by hand`,
+    );
+  }
+
+  const members = new Set(category.appids);
+  const affected: number[] = [];
+  const skipped: number[] = [];
+  for (const id of new Set(appids)) {
+    (members.has(id) === (mode === 'remove') ? affected : skipped).push(id);
+  }
+
+  const targets = new Set(appids);
+  const edit = updateValue(raw, category.key, now, (value) => {
+    let added = Array.isArray(value['added']) ? (value['added'] as unknown[]) : [];
+    if (mode === 'add') {
+      added = [...added, ...affected.filter((id) => !added.includes(id))];
+    } else {
+      added = added.filter((id) => !targets.has(id as number));
+    }
+    value['added'] = added;
+    if (Array.isArray(value['removed'])) {
+      value['removed'] = (value['removed'] as unknown[]).filter((id) => !targets.has(id as number));
+    }
+  });
+  return { ...edit, affected, skipped };
+}
+
+/**
+ * Add appids to a category. Favorites and Hidden are created when missing,
+ * as Steam only stores them once they have members.
+ */
+export function addApps(raw: string, query: string, appids: number[], now = nowSeconds()): MembershipEdit {
+  const q = query.trim().toLowerCase();
+  const special = SPECIAL[q.startsWith(KEY_PREFIX) ? q.slice(KEY_PREFIX.length) : q];
+  if (special && !findCategory(parseCategories(raw), query)) {
+    const pairs = loadPairs(raw);
+    const key = KEY_PREFIX + special.id;
+    const added = [...new Set(appids)];
+    const entry = newEntry(key, { id: special.id, name: special.name, added, removed: [] }, now);
+    const index = pairIndex(pairs, key);
+    if (index === -1) {
+      pairs.push([key, entry]);
+    } else {
+      // Revive the tombstone, keeping its server version.
+      const version = pairs[index][1]['version'];
+      pairs[index] = [key, version !== undefined ? { ...entry, version } : entry];
+    }
+    return { raw: JSON.stringify(pairs), key, changed: true, affected: added, skipped: [] };
+  }
+  return editMembership(raw, query, appids, now, 'add');
+}
+
+/** Remove appids from a category the way Steam does: drop them from `added`. */
+export function removeApps(raw: string, query: string, appids: number[], now = nowSeconds()): MembershipEdit {
+  return editMembership(raw, query, appids, now, 'remove');
+}
+
+/** Append a new, empty custom collection. */
+export function createCategory(
+  raw: string,
+  name: string,
+  now = nowSeconds(),
+  id = randomCollectionId(),
+): CategoryEdit {
+  const cleaned = cleanName(name);
+  assertNameFree(raw, cleaned);
+  const pairs = loadPairs(raw);
+  const collectionId = `uc-${id}`;
+  const key = KEY_PREFIX + collectionId;
+  if (pairIndex(pairs, key) !== -1) throw new CategoryError(`Key ${key} is already taken`);
+  pairs.push([key, newEntry(key, { id: collectionId, name: cleaned, added: [], removed: [] }, now)]);
+  return { raw: JSON.stringify(pairs), key, changed: true };
+}
+
+export function renameCategory(raw: string, query: string, newName: string, now = nowSeconds()): CategoryEdit {
+  const cleaned = cleanName(newName);
+  const category = resolveCategory(raw, query);
+  assertNotSpecial(category, 'renamed');
+  assertNameFree(raw, cleaned, category.key);
+  return updateValue(raw, category.key, now, (value) => {
+    value['name'] = cleaned;
+  });
+}
+
+/** Replace the entry with a tombstone, the shape Steam itself writes. */
+export function deleteCategory(raw: string, query: string, now = nowSeconds()): CategoryEdit {
+  const category = resolveCategory(raw, query);
+  assertNotSpecial(category, 'deleted');
+  const pairs = loadPairs(raw);
+  const index = pairIndex(pairs, category.key);
+  const version = pairs[index][1]['version'];
+  pairs[index] = [
+    category.key,
+    { key: category.key, timestamp: now, is_deleted: true, ...(version !== undefined ? { version } : {}) },
+  ];
+  return { raw: JSON.stringify(pairs), key: category.key, changed: true };
+}
+
+function writeAtomic(file: string, content: string): void {
+  const tmp = `${file}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, content, 'utf-8');
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    fs.rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
+/**
+ * Write new namespace text: back up the old file to .bak, replace it
+ * atomically and list `key` in the .modified.json sibling so Steam uploads it.
+ */
+export function writeCategoriesFile(file: string, raw: string, key: string): void {
+  const modifiedPath = file.replace(/\.json$/, '.modified.json');
+  let modified: unknown = [];
+  if (fs.existsSync(modifiedPath)) {
+    try {
+      modified = JSON.parse(fs.readFileSync(modifiedPath, 'utf-8'));
+    } catch {
+      modified = null;
+    }
+    if (!Array.isArray(modified)) {
+      throw new CategoryError(`${path.basename(modifiedPath)} is not a JSON array; nothing was written`);
+    }
+  }
+  const keys = modified as unknown[];
+
+  // Mark first: a marked but unchanged key is harmless, an unmarked edit may be
+  // replaced by the cloud copy.
+  if (!keys.includes(key)) writeAtomic(modifiedPath, JSON.stringify([...keys, key]));
+  fs.copyFileSync(file, `${file}.bak`);
+  writeAtomic(file, raw);
+}
+
+/**
+ * Run an edit against the active account's categories file and write the
+ * result. Refuses while Steam is running: it would overwrite the file from
+ * memory on exit.
+ */
+export function editCategories<T extends CategoryEdit>(edit: (raw: string) => T): T {
+  const file = findCategoriesFile();
+  if (!file) {
+    throw new CategoryError(
+      'No cloud-storage-namespace-1.json found. Open the Steam library once so Steam creates it.',
+    );
+  }
+  if (isSteamRunning()) {
+    throw new CategoryError(
+      [
+        'WARNING: Steam is currently running!',
+        'Steam keeps categories in memory and overwrites cloud-storage-namespace-1.json when it exits.',
+        'Please close Steam first, then try again.',
+        '',
+        'Categories were NOT modified.',
+      ].join('\n'),
+    );
+  }
+  const result = edit(fs.readFileSync(file, 'utf-8'));
+  if (result.changed) writeCategoriesFile(file, result.raw, result.key);
+  return result;
 }

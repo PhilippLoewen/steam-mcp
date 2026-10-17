@@ -136,11 +136,20 @@ Each tool uses an `action` parameter to select the operation. 14 tools cover 66 
 | `random` | Pick a random installed game |
 | `unplayed` | Find games you own but haven't played |
 
-### `library` — Library folders and stats
+### `library` — Library folders, stats and categories
 | Action | Description |
 |--------|-------------|
 | `list` | List all Steam library folders with sizes and free space |
 | `stats` | Aggregate stats: total games, playtime, disk usage |
+| `categories` | List library categories (Favorites, Hidden, tag and custom collections) |
+| `category` | Show one category's games (`name`) |
+| `category_add` | Add games to a category (`name`, `appids`); Favorites/Hidden are created if missing |
+| `category_remove` | Remove games from a category (`name`, `appids`) |
+| `category_create` | Create an empty custom category (`name`) |
+| `category_rename` | Rename a category (`name`, `newName`) |
+| `category_delete` | Delete a category (`name`) |
+
+Category edits need Steam to be **closed**, since Steam overwrites the file from memory when it exits. They write `userdata/<id>/config/cloudstorage/cloud-storage-namespace-1.json` (the old version is kept as `.bak`) and list the changed key in `cloud-storage-namespace-1.modified.json`, so Steam uploads it to the cloud on its next start. Dynamic (filter-based) collections can be renamed or deleted, but their games can't be edited by hand.
 
 ### `steam_status` — Steam client status
 | Action | Description |
@@ -301,6 +310,7 @@ src/
 │   ├── compat.ts            # Proton/Wine compatibility tracking
 │   ├── workshop.ts          # Workshop manifest reading
 │   ├── shortcuts.ts         # Binary shortcuts.vdf read/write
+│   ├── categories.ts        # Library categories (cloud-storage-namespace-1.json) read/write
 │   ├── api.ts               # Steam Web API client
 │   ├── api-types.ts         # Shared API response types
 │   ├── wishlist.ts          # Wishlist data fetching

@@ -6,7 +6,20 @@ import { getAllPlaytimes } from '../steam/userdata.js';
 import { steamApiRequest, storeApiRequest, hasApiKey } from '../steam/api.js';
 import type { OwnedGamesResponse } from '../steam/api-types.js';
 import { getUserConfig } from '../steam/paths.js';
-import { findCategory, readCategories } from '../steam/categories.js';
+import {
+  addApps,
+  type Category,
+  type CategoryEdit,
+  CategoryError,
+  createCategory,
+  deleteCategory,
+  editCategories,
+  findCategory,
+  parseCategories,
+  readCategories,
+  removeApps,
+  renameCategory,
+} from '../steam/categories.js';
 import { formatBytes, formatPlaytime, formatTimestamp } from '../util/format.js';
 
 /**
@@ -56,17 +69,108 @@ function errorResult(message: string) {
   return { content: [{ type: 'text' as const, text: message }], isError: true };
 }
 
+async function describeCategory(category: Category) {
+  const names = await resolveAppNames(category.appids);
+  return {
+    name: category.name,
+    key: category.key,
+    kind: category.kind,
+    version: category.version,
+    timestamp: category.timestamp,
+    appids: category.appids.map((appid) => ({ appid, name: names.get(appid) ?? null })),
+    ...(category.filterSpec ? { filterSpec: category.filterSpec } : {}),
+  };
+}
+
+/**
+ * Run a category edit and report the edited category (or just its key once
+ * deleted), plus any action-specific fields from `extra`.
+ */
+async function runCategoryEdit<T extends CategoryEdit>(
+  action: string,
+  edit: (raw: string) => T,
+  extra: (result: T) => object = () => ({}),
+) {
+  try {
+    const result = editCategories(edit);
+    const category = parseCategories(result.raw).find((c) => c.key === result.key);
+    return textResult({
+      changed: result.changed,
+      ...extra(result),
+      ...(category ? { category: await describeCategory(category) } : { key: result.key }),
+    });
+  } catch (error) {
+    if (error instanceof CategoryError) return errorResult(error.message);
+    const msg = error instanceof Error ? error.message : String(error);
+    return errorResult(`Error in ${action}: ${msg}`);
+  }
+}
+
+function requiredParam(names: string, action: string) {
+  return errorResult(`Action "${action}" requires ${names}`);
+}
+
 export function registerLibraryTools(server: McpServer): void {
   server.tool(
     'library',
-    'List library folders, get aggregate stats, or read library categories (Steam collections: Favorites, Hidden, tag/custom shelves)',
+    'List library folders, get aggregate stats, or read and edit library categories (Steam collections: Favorites, Hidden, tag/custom shelves). Edits require Steam to be closed.',
     {
-      action: z.enum(['list', 'stats', 'categories', 'category']).default('list'),
-      name: z.string().optional().describe('Category name or key (for action "category")'),
+      action: z
+        .enum([
+          'list',
+          'stats',
+          'categories',
+          'category',
+          'category_add',
+          'category_remove',
+          'category_create',
+          'category_rename',
+          'category_delete',
+        ])
+        .default('list'),
+      name: z.string().optional().describe('Category name or key (for "category" and "category_*")'),
+      appids: z.array(z.number().int()).optional().describe('Appids to add or remove (for "category_add"/"category_remove")'),
+      newName: z.string().optional().describe('New name (for "category_rename")'),
       includeDeleted: z.boolean().optional().describe('Include deleted categories (for "categories")'),
     },
     async (params) => {
       switch (params.action) {
+        case 'category_add': {
+          const { name, appids } = params;
+          if (!name || !appids?.length) return requiredParam('"name" and "appids"', params.action);
+          return runCategoryEdit(params.action, (raw) => addApps(raw, name, appids), (r) => ({
+            added: r.affected,
+            alreadyPresent: r.skipped,
+          }));
+        }
+
+        case 'category_remove': {
+          const { name, appids } = params;
+          if (!name || !appids?.length) return requiredParam('"name" and "appids"', params.action);
+          return runCategoryEdit(params.action, (raw) => removeApps(raw, name, appids), (r) => ({
+            removed: r.affected,
+            notPresent: r.skipped,
+          }));
+        }
+
+        case 'category_create': {
+          const { name } = params;
+          if (!name) return requiredParam('"name"', params.action);
+          return runCategoryEdit(params.action, (raw) => createCategory(raw, name));
+        }
+
+        case 'category_rename': {
+          const { name, newName } = params;
+          if (!name || !newName) return requiredParam('"name" and "newName"', params.action);
+          return runCategoryEdit(params.action, (raw) => renameCategory(raw, name, newName));
+        }
+
+        case 'category_delete': {
+          const { name } = params;
+          if (!name) return requiredParam('"name"', params.action);
+          return runCategoryEdit(params.action, (raw) => deleteCategory(raw, name));
+        }
+
         case 'categories': {
           try {
             const categories = readCategories(params.includeDeleted ?? false);
@@ -103,16 +207,7 @@ export function registerLibraryTools(server: McpServer): void {
                 `Category "${params.name}" not found. Available: ${categories.map((c) => c.name).join(', ') || '(none)'}`,
               );
             }
-            const names = await resolveAppNames(category.appids);
-            return textResult({
-              name: category.name,
-              key: category.key,
-              kind: category.kind,
-              version: category.version,
-              timestamp: category.timestamp,
-              appids: category.appids.map((appid) => ({ appid, name: names.get(appid) ?? null })),
-              ...(category.filterSpec ? { filterSpec: category.filterSpec } : {}),
-            });
+            return textResult(await describeCategory(category));
           } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
             return errorResult(`Error reading category: ${msg}`);
