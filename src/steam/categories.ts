@@ -10,9 +10,10 @@ import { getSteamDir, getUserConfig, isSteamRunning } from './paths.js';
  * That file is a cloud-synced cache owned by the Steam client. Edits are only
  * written while Steam is closed: the changed key is listed in
  * cloud-storage-namespace-1.modified.json so Steam uploads it on its next start.
+ * While Steam runs, edits go through the Millennium bridge (millennium.ts).
  */
 
-const KEY_PREFIX = 'user-collections.';
+export const KEY_PREFIX = 'user-collections.';
 
 export interface FilterGroup {
   rgOptions?: unknown[];
@@ -42,6 +43,12 @@ export interface Category {
   hasFilter: boolean;
   filterSpec?: FilterSpec;
   isDeleted: boolean;
+}
+
+/** `id` is the key without the user-collections. prefix. */
+export function categoryKind(id: string, filterOnly: boolean): CategoryKind {
+  if (id.startsWith('from-tag-')) return 'tag';
+  return filterOnly ? 'filter' : 'explicit';
 }
 
 function toAppids(value: unknown): number[] {
@@ -96,16 +103,10 @@ export function parseCategories(raw: string, includeDeleted = false): Category[]
         ? (value['filterSpec'] as FilterSpec)
         : undefined;
 
-    const kind: CategoryKind = suffix.startsWith('from-tag-')
-      ? 'tag'
-      : filterSpec && added.length === 0
-        ? 'filter'
-        : 'explicit';
-
     result.push({
       name: typeof value['name'] === 'string' ? value['name'] : suffix,
       key,
-      kind,
+      kind: categoryKind(suffix, filterSpec !== undefined && added.length === 0),
       version: typeof entry['version'] === 'string' ? entry['version'] : null,
       timestamp: typeof entry['timestamp'] === 'number' ? entry['timestamp'] : null,
       appids,
@@ -433,6 +434,24 @@ export function writeCategoriesFile(file: string, raw: string, key: string): voi
 }
 
 /**
+ * The refusal for file edits under a running Steam. `bridgeStatus` says why
+ * the Millennium bridge couldn't take the edit instead, when known.
+ */
+export function steamRunningError(bridgeStatus?: string): CategoryError {
+  return new CategoryError(
+    [
+      'WARNING: Steam is currently running!',
+      'Steam keeps categories in memory and overwrites cloud-storage-namespace-1.json when it exits.',
+      'Please close Steam first, then try again, or install the steam-mcp-bridge Millennium plugin',
+      '(millennium-plugin/ in the steam-mcp repo) to edit categories while Steam runs.',
+      ...(bridgeStatus ? [`Millennium bridge: ${bridgeStatus}.`] : []),
+      '',
+      'Categories were NOT modified.',
+    ].join('\n'),
+  );
+}
+
+/**
  * Run an edit against the active account's categories file and write the
  * result. Refuses while Steam is running: it would overwrite the file from
  * memory on exit.
@@ -444,17 +463,7 @@ export function editCategories<T extends CategoryEdit>(edit: (raw: string) => T)
       'No cloud-storage-namespace-1.json found. Open the Steam library once so Steam creates it.',
     );
   }
-  if (isSteamRunning()) {
-    throw new CategoryError(
-      [
-        'WARNING: Steam is currently running!',
-        'Steam keeps categories in memory and overwrites cloud-storage-namespace-1.json when it exits.',
-        'Please close Steam first, then try again.',
-        '',
-        'Categories were NOT modified.',
-      ].join('\n'),
-    );
-  }
+  if (isSteamRunning()) throw steamRunningError();
   const result = edit(fs.readFileSync(file, 'utf-8'));
   if (result.changed) writeCategoriesFile(file, result.raw, result.key);
   return result;

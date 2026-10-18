@@ -5,7 +5,7 @@ import { readAllManifests } from '../steam/manifests.js';
 import { getAllPlaytimes } from '../steam/userdata.js';
 import { steamApiRequest, storeApiRequest, hasApiKey } from '../steam/api.js';
 import type { OwnedGamesResponse } from '../steam/api-types.js';
-import { getUserConfig } from '../steam/paths.js';
+import { getUserConfig, isSteamRunning } from '../steam/paths.js';
 import {
   addApps,
   type Category,
@@ -15,11 +15,21 @@ import {
   deleteCategory,
   editCategories,
   findCategory,
+  KEY_PREFIX,
+  type MembershipEdit,
   parseCategories,
   readCategories,
   removeApps,
   renameCategory,
+  steamRunningError,
 } from '../steam/categories.js';
+import {
+  bridgeCategory,
+  type BridgeRequest,
+  BridgeTimeoutError,
+  runBridgeEdit,
+  verifyBridgeEdit,
+} from '../steam/millennium.js';
 import { formatBytes, formatPlaytime, formatTimestamp } from '../util/format.js';
 
 /**
@@ -82,21 +92,72 @@ async function describeCategory(category: Category) {
   };
 }
 
+/** Result field names for the appids a membership edit changed and skipped. */
+interface MembershipFields {
+  affected: string;
+  skipped: string;
+}
+
+/**
+ * Report a bridge edit the plugin never acknowledged by what the categories
+ * file shows. Still an error when the file doesn't show it done: Steam may
+ * not have saved it yet, or the edit never ran.
+ */
+async function readBackBridgeEdit(request: BridgeRequest, timeout: BridgeTimeoutError) {
+  const { applied, category } = verifyBridgeEdit(request, readCategories() ?? []);
+  if (!applied) {
+    return errorResult(`${timeout.message} The categories file doesn't show it yet; check again before retrying.`);
+  }
+  return textResult({
+    changed: null,
+    via: 'millennium',
+    verifiedByReadback: true,
+    note: `${timeout.message} The categories file shows it applied.`,
+    ...(category ? { category: await describeCategory(category) } : {}),
+  });
+}
+
 /**
  * Run a category edit and report the edited category (or just its key once
- * deleted), plus any action-specific fields from `extra`.
+ * deleted). While Steam runs, `request` goes through the Millennium bridge;
+ * otherwise `fileEdit` rewrites the categories file.
  */
-async function runCategoryEdit<T extends CategoryEdit>(
+export async function runCategoryEdit(
   action: string,
-  edit: (raw: string) => T,
-  extra: (result: T) => object = () => ({}),
+  request: BridgeRequest,
+  fileEdit: (raw: string) => CategoryEdit & Partial<Pick<MembershipEdit, 'affected' | 'skipped'>>,
+  membershipFields?: MembershipFields,
 ) {
+  const membership = (r: { affected?: number[]; skipped?: number[] }) =>
+    membershipFields
+      ? { [membershipFields.affected]: r.affected ?? [], [membershipFields.skipped]: r.skipped ?? [] }
+      : {};
+
   try {
-    const result = editCategories(edit);
+    if (isSteamRunning()) {
+      let bridged: Awaited<ReturnType<typeof runBridgeEdit>>;
+      try {
+        bridged = await runBridgeEdit(request);
+      } catch (error) {
+        if (!(error instanceof BridgeTimeoutError)) throw error;
+        return readBackBridgeEdit(request, error);
+      }
+      if ('unavailable' in bridged) throw steamRunningError(bridged.unavailable);
+      return textResult({
+        changed: bridged.changed,
+        via: 'millennium',
+        ...membership(bridged),
+        ...(bridged.collection
+          ? { category: await describeCategory(bridgeCategory(bridged.collection)) }
+          : { key: KEY_PREFIX + bridged.id }),
+      });
+    }
+
+    const result = editCategories(fileEdit);
     const category = parseCategories(result.raw).find((c) => c.key === result.key);
     return textResult({
       changed: result.changed,
-      ...extra(result),
+      ...membership(result),
       ...(category ? { category: await describeCategory(category) } : { key: result.key }),
     });
   } catch (error) {
@@ -113,7 +174,7 @@ function requiredParam(names: string, action: string) {
 export function registerLibraryTools(server: McpServer): void {
   server.tool(
     'library',
-    'List library folders, get aggregate stats, or read and edit library categories (Steam collections: Favorites, Hidden, tag/custom shelves). Edits require Steam to be closed.',
+    'List library folders, get aggregate stats, or read and edit library categories (Steam collections: Favorites, Hidden, tag/custom shelves). Edits need Steam closed, or the steam-mcp-bridge Millennium plugin while it runs.',
     {
       action: z
         .enum([
@@ -138,37 +199,43 @@ export function registerLibraryTools(server: McpServer): void {
         case 'category_add': {
           const { name, appids } = params;
           if (!name || !appids?.length) return requiredParam('"name" and "appids"', params.action);
-          return runCategoryEdit(params.action, (raw) => addApps(raw, name, appids), (r) => ({
-            added: r.affected,
-            alreadyPresent: r.skipped,
-          }));
+          return runCategoryEdit(
+            params.action,
+            { action: 'add', name, appids },
+            (raw) => addApps(raw, name, appids),
+            { affected: 'added', skipped: 'alreadyPresent' },
+          );
         }
 
         case 'category_remove': {
           const { name, appids } = params;
           if (!name || !appids?.length) return requiredParam('"name" and "appids"', params.action);
-          return runCategoryEdit(params.action, (raw) => removeApps(raw, name, appids), (r) => ({
-            removed: r.affected,
-            notPresent: r.skipped,
-          }));
+          return runCategoryEdit(
+            params.action,
+            { action: 'remove', name, appids },
+            (raw) => removeApps(raw, name, appids),
+            { affected: 'removed', skipped: 'notPresent' },
+          );
         }
 
         case 'category_create': {
           const { name } = params;
           if (!name) return requiredParam('"name"', params.action);
-          return runCategoryEdit(params.action, (raw) => createCategory(raw, name));
+          return runCategoryEdit(params.action, { action: 'create', name }, (raw) => createCategory(raw, name));
         }
 
         case 'category_rename': {
           const { name, newName } = params;
           if (!name || !newName) return requiredParam('"name" and "newName"', params.action);
-          return runCategoryEdit(params.action, (raw) => renameCategory(raw, name, newName));
+          return runCategoryEdit(params.action, { action: 'rename', name, newName }, (raw) =>
+            renameCategory(raw, name, newName),
+          );
         }
 
         case 'category_delete': {
           const { name } = params;
           if (!name) return requiredParam('"name"', params.action);
-          return runCategoryEdit(params.action, (raw) => deleteCategory(raw, name));
+          return runCategoryEdit(params.action, { action: 'delete', name }, (raw) => deleteCategory(raw, name));
         }
 
         case 'categories': {

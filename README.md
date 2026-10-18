@@ -149,7 +149,19 @@ Each tool uses an `action` parameter to select the operation. 14 tools cover 66 
 | `category_rename` | Rename a category (`name`, `newName`) |
 | `category_delete` | Delete a category (`name`) |
 
-Category edits need Steam to be **closed**, since Steam overwrites the file from memory when it exits. They write `userdata/<id>/config/cloudstorage/cloud-storage-namespace-1.json` (the old version is kept as `.bak`) and list the changed key in `cloud-storage-namespace-1.modified.json`, so Steam uploads it to the cloud on its next start. Dynamic (filter-based) collections can be renamed or deleted, but their games can't be edited by hand.
+While Steam is **running**, category edits go through the [steam-mcp-bridge Millennium plugin](#editing-categories-while-steam-runs) when it is installed (the result then says `"via": "millennium"`); without it they are refused. While Steam is **closed**, edits write `userdata/<id>/config/cloudstorage/cloud-storage-namespace-1.json` (the old version is kept as `.bak`) and list the changed key in `cloud-storage-namespace-1.modified.json`, so Steam uploads it to the cloud on its next start. Dynamic (filter-based) collections can be renamed or deleted, but their games can't be edited by hand.
+
+#### Editing categories while Steam runs
+
+Steam keeps categories in memory, so editing the file under a running Steam doesn't stick. With [Millennium](https://steambrew.app/) (v3.4+) installed, the bundled `millennium-plugin/` makes the edit inside the Steam client through its own collection store. Steam then saves and cloud-syncs it as if you had made it in the library.
+
+```bash
+cd millennium-plugin
+bun install
+bun run build      # packs steam-mcp-bridge.star into the Millennium plugins folder
+```
+
+Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talks to Millennium over `/tmp/millennium-mep.sock`; set `MILLENNIUM_MEP_SOCKET` if yours lives elsewhere (e.g. when the MCP server runs in a sandbox with a private `/tmp`). Live edits only cover games Steam knows in this library, and renaming relies on a Steam client internal, so it reports an error if a Steam update breaks it.
 
 ### `steam_status` — Steam client status
 | Action | Description |
@@ -311,6 +323,7 @@ src/
 │   ├── workshop.ts          # Workshop manifest reading
 │   ├── shortcuts.ts         # Binary shortcuts.vdf read/write
 │   ├── categories.ts        # Library categories (cloud-storage-namespace-1.json) read/write
+│   ├── millennium.ts        # Live category edits via the Millennium bridge plugin
 │   ├── api.ts               # Steam Web API client
 │   ├── api-types.ts         # Shared API response types
 │   ├── wishlist.ts          # Wishlist data fetching
@@ -321,6 +334,7 @@ src/
     ├── format.ts            # formatBytes, formatPlaytime, formatTimestamp
     ├── cache.ts             # FileCache<T> with mtime invalidation
     └── fs.ts                # Shared filesystem utilities
+millennium-plugin/           # steam-mcp-bridge: Millennium plugin for live category edits
 ```
 
 ## License
