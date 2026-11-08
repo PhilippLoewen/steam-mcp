@@ -1,6 +1,5 @@
 # Steam MCP Server
 
-[![npm version](https://img.shields.io/npm/v/@praeses/steam-mcp)](https://www.npmjs.com/package/@praeses/steam-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A feature-rich [Model Context Protocol](https://modelcontextprotocol.io/) server that gives AI assistants full access to your Steam game library. Works on **Linux, macOS, and Windows**. 14 consolidated tools covering 66 actions — most work from local files with **no API key needed**. Optional Steam Web API key unlocks online data like achievements, friends, and full library access.
@@ -28,21 +27,21 @@ Works with Claude Desktop, Claude Code, or any MCP-compatible client.
 
 ## Installation
 
-### npm (recommended)
+steam-mcp is a single native binary written in Rust. Build and install it with
+[Cargo](https://rustup.rs/) (Rust 1.88+):
 
 ```bash
-npx @praeses/steam-mcp
+cargo install --git https://github.com/Praeses0/steam-mcp.git
 ```
 
-No install needed — just add it to your MCP client config (see below).
-
-### Global install
+or from a checkout:
 
 ```bash
-npm install -g @praeses/steam-mcp
+cargo install --path .
 ```
 
-Then use `steam-mcp` as the command instead of `npx @praeses/steam-mcp`.
+This puts `steam-mcp` in `~/.cargo/bin`. Use that as the command in your MCP client
+config (or its absolute path if `~/.cargo/bin` isn't on the client's `PATH`).
 
 ### Configure with Claude Desktop
 
@@ -55,8 +54,7 @@ Add to your Claude Desktop config:
 {
   "mcpServers": {
     "steam": {
-      "command": "npx",
-      "args": ["@praeses/steam-mcp"],
+      "command": "steam-mcp",
       "env": {
         "STEAM_API_KEY": "your-key-here"
       }
@@ -73,8 +71,7 @@ Add a `.mcp.json` in your project root, or add to `~/.claude.json` for system-wi
 {
   "mcpServers": {
     "steam": {
-      "command": "npx",
-      "args": ["@praeses/steam-mcp"],
+      "command": "steam-mcp",
       "env": {
         "STEAM_API_KEY": "your-key-here"
       }
@@ -114,7 +111,6 @@ When unset, all categories are enabled (14 tools, ~3,200 tokens of context).
 
 ### Prerequisites
 
-- Node.js 18+
 - Steam installed in the default location:
   - **Linux**: `~/.local/share/Steam/`
   - **macOS**: `~/Library/Application Support/Steam/`
@@ -161,7 +157,7 @@ bun install
 bun run build      # packs steam-mcp-bridge.star into the Millennium plugins folder
 ```
 
-Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talks to Millennium over `/tmp/millennium-mep.sock`; set `MILLENNIUM_MEP_SOCKET` if yours lives elsewhere (e.g. when the MCP server runs in a sandbox with a private `/tmp`). Live edits only cover games Steam knows in this library, and renaming relies on a Steam client internal, so it reports an error if a Steam update breaks it.
+Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talks to Millennium over `/tmp/millennium-mep.sock`; set `MILLENNIUM_MEP_SOCKET` if yours lives elsewhere (e.g. when the MCP server runs in a sandbox with a private `/tmp`). The bridge works on Linux and macOS; on Windows, category edits need Steam closed. Live edits only cover games Steam knows in this library, and renaming relies on a Steam client internal, so it reports an error if a Steam update breaks it.
 
 ### `steam_status` — Steam client status
 | Action | Description |
@@ -284,56 +280,42 @@ Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talk
 - **Multi-library** — supports multiple Steam library folders including external drives
 - **Category filtering** — enable only the tool groups you need via `STEAM_TOOLS` env var
 - **Custom VDF parsers** — both text and binary formats, no external dependencies
+- **Single native binary** — no Node.js runtime; starts instantly
 
 ## Development
-
-### Install from source
 
 ```bash
 git clone https://github.com/Praeses0/steam-mcp.git
 cd steam-mcp
-npm install
-npm run build
-```
-
-### Commands
-
-```bash
-npm run dev      # Run with tsx (auto-reload)
-npm run build    # Compile TypeScript
-npm test         # Run tests
+cargo build --release   # binary at target/release/steam-mcp
+cargo test              # unit tests
+cargo clippy --all-targets
 ```
 
 ## Architecture
 
 ```
 src/
-├── index.ts                 # Server entry, category-based tool registration
+├── main.rs                  # Entry point: stdio transport, STEAM_TOOLS filtering
+├── server.rs                # MCP handler: tools/list and tools/call dispatch
+├── tool.rs                  # Tool/parameter specs, JSON Schema, argument validation
+├── util.rs                  # Formatting (bytes, playtime, timestamps), fs helpers, FileCache
 ├── vdf/
-│   ├── parser.ts            # Text VDF recursive descent parser + serializer
-│   ├── binary-parser.ts     # Binary VDF parser (shortcuts.vdf)
-│   ├── binary-writer.ts     # Binary VDF writer (shortcut management)
-│   └── types.ts             # VdfValue, VdfObject types
+│   ├── text.rs              # Text VDF recursive descent parser + serializer
+│   └── binary.rs            # Binary VDF parser + writer (shortcuts.vdf)
 ├── steam/
-│   ├── paths.ts             # Cross-platform Steam dir resolution, user detection
-│   ├── manifests.ts         # App manifest reading with mtime caching
-│   ├── library.ts           # Library folder operations + disk info
-│   ├── userdata.ts          # localconfig.vdf read/write
-│   ├── compat.ts            # Proton/Wine compatibility tracking
-│   ├── workshop.ts          # Workshop manifest reading
-│   ├── shortcuts.ts         # Binary shortcuts.vdf read/write
-│   ├── categories.ts        # Library categories (cloud-storage-namespace-1.json) read/write
-│   ├── millennium.ts        # Live category edits via the Millennium bridge plugin
-│   ├── api.ts               # Steam Web API client
-│   ├── api-types.ts         # Shared API response types
-│   ├── wishlist.ts          # Wishlist data fetching
-│   ├── logs.ts              # Steam log parsing
-│   └── types.ts             # Domain types
-├── tools/                   # 14 consolidated MCP tools (one file per tool)
-└── util/
-    ├── format.ts            # formatBytes, formatPlaytime, formatTimestamp
-    ├── cache.ts             # FileCache<T> with mtime invalidation
-    └── fs.ts                # Shared filesystem utilities
+│   ├── paths.rs             # Cross-platform Steam dir resolution, user detection
+│   ├── manifests.rs         # App manifest reading with mtime caching
+│   ├── library.rs           # Library folder operations + disk info
+│   ├── userdata.rs          # localconfig.vdf read/write
+│   ├── compat.rs            # Proton/Wine compatibility tracking
+│   ├── workshop.rs          # Workshop manifest reading
+│   ├── shortcuts.rs         # Binary shortcuts.vdf read/write
+│   ├── categories.rs        # Library categories (cloud-storage-namespace-1.json) read/write
+│   ├── millennium.rs        # Live category edits via the Millennium bridge plugin
+│   ├── api.rs               # Steam Web API / Store API client
+│   └── wishlist.rs          # Wishlist data fetching
+└── tools/                   # 14 consolidated MCP tools (one file per tool)
 millennium-plugin/           # steam-mcp-bridge: Millennium plugin for live category edits
 ```
 

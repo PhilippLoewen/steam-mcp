@@ -1,0 +1,35 @@
+[package]
+name = "steam-mcp"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "MCP server for Steam game library management: 14 consolidated tools, minimal context footprint, local files + optional API"
+license = "MIT"
+repository = "https://github.com/Praeses0/steam-mcp"
+readme = "README.md"
+keywords = ["steam", "mcp", "model-context-protocol", "proton", "linux-gaming"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = "0.3"
+icu_collator = "2"
+indexmap = "2"
+libc = "0.2"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+rmcp = { version = "3", features = ["server", "transport-io"] }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "time", "fs", "process"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
