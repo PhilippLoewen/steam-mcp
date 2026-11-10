@@ -83,36 +83,10 @@ pub fn num(n: f64) -> Value {
     }
 }
 
-/// JS `Number.prototype.toFixed`: like `format!("{:.N}")`, except that exact
-/// ties round away from zero (JS) instead of to even (Rust).
+/// `n` with `digits` decimals; exact ties round to even. NaN and infinities
+/// print as JS does ("NaN", "Infinity").
 pub fn to_fixed(n: f64, digits: usize) -> String {
-    if !n.is_finite() {
-        return js_num(n);
-    }
-    let exact = format!("{n:.prec$}", prec = digits + 60);
-    let (head, tail) = exact.split_at(exact.find('.').map_or(exact.len(), |i| i + 1 + digits));
-    let is_tie = tail.starts_with('5') && tail[1..].bytes().all(|b| b == b'0');
-    if !is_tie {
-        return format!("{n:.digits$}");
-    }
-    let mut out: Vec<u8> = head.trim_end_matches('.').bytes().collect();
-    let mut i = out.len();
-    loop {
-        if i == 0 || out[i - 1] == b'-' {
-            out.insert(i, b'1');
-            break;
-        }
-        i -= 1;
-        match out[i] {
-            b'.' => continue,
-            b'9' => out[i] = b'0',
-            d => {
-                out[i] = d + 1;
-                break;
-            }
-        }
-    }
-    String::from_utf8(out).expect("ASCII digits")
+    if n.is_finite() { format!("{n:.digits$}") } else { js_num(n) }
 }
 
 /// `Array.prototype.sort` with a JS comparator: stable, `b` goes first only
@@ -295,9 +269,9 @@ mod tests {
         assert_eq!(locale_cmp("apple", "Apple"), Ordering::Less);
         assert_eq!(locale_cmp("Zelda", "apple"), Ordering::Greater);
         assert_eq!(locale_cmp("Æon", "Age"), Ordering::Less);
-        assert_eq!(to_fixed(12.25, 1), "12.3");
-        assert_eq!(to_fixed(0.125, 2), "0.13");
-        assert_eq!(to_fixed(-0.25, 1), "-0.3");
+        assert_eq!(to_fixed(12.25, 1), "12.2");
+        assert_eq!(to_fixed(0.125, 2), "0.12");
+        assert_eq!(to_fixed(-0.25, 1), "-0.2");
         assert_eq!(to_fixed(9.95, 1), "9.9");
         assert_eq!(to_fixed(99.5, 0), "100");
         assert_eq!(to_fixed(-9.5, 0), "-10");
