@@ -33,6 +33,9 @@ pub fn tool() -> Tool {
             Param::new("lines", ParamType::Number),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[],
+        destructive: false,
+        open_world: true,
     }
 }
 

@@ -17,6 +17,9 @@ pub fn tool() -> Tool {
             Param::new("action", ParamType::Enum(&["status", "queue", "progress"])).default("status"),
             Param::new("appid", ParamType::Number),
         ],
+        writes: &[],
+        destructive: false,
+        open_world: false,
         handler: |args| {
             boxed(async move {
                 match args.str("action").as_deref() {

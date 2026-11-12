@@ -6,8 +6,9 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+use crate::steam::launch_options::{check_launch_options, check_shortcut_exe, check_start_dir};
 use crate::steam::shortcuts::{ShortcutEntry, add_shortcuts, read_shortcuts, remove_shortcut};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{format_timestamp, home_dir, js_num};
 
 pub fn tool() -> Tool {
@@ -26,6 +27,9 @@ pub fn tool() -> Tool {
             Param::new("game_ids", ParamType::ArrayOfNumbers).describe("Lutris game IDs to import; omit for all"),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[Write::Action("add"), Write::Action("remove"), Write::Action("import_lutris")],
+        destructive: true,
+        open_world: false,
     }
 }
 
@@ -125,13 +129,31 @@ fn add(args: &Args) -> Result<ToolResult> {
     let (Some(name), Some(exe)) = (name, exe) else {
         return Ok(ToolResult::error("Error: \"name\" and \"exe\" are required for the add action."));
     };
+    let launch_options = args.str("launch_options").unwrap_or_default();
+    // Save the checked paths, not links that could be repointed later.
+    let checked = check_shortcut_exe(&exe).and_then(|exe| {
+        let start_dir = check_start_dir(&args.str("start_dir").unwrap_or_else(|| dirname(&exe)))?;
+        check_launch_options(&launch_options)?;
+        Ok((exe, start_dir))
+    });
+    let (exe, start_dir) = match checked {
+        Ok(checked) => checked,
+        Err(why) => {
+            return Ok(ToolResult::error(format!(
+                "Shortcut NOT added: {why}. For anything else, add the shortcut in Steam yourself."
+            )));
+        }
+    };
 
+    // Quoted, as Steam writes these fields itself: Steam puts them into the
+    // command line it may run through a shell, and the checks above leave
+    // nothing a shell would interpret inside double quotes.
     let entry = ShortcutEntry {
         appid: generate_shortcut_id(&exe, &name),
-        start_dir: args.str("start_dir").unwrap_or_else(|| dirname(&exe)),
+        start_dir: format!("\"{start_dir}\""),
         app_name: name,
-        exe,
-        launch_options: args.str("launch_options").unwrap_or_default(),
+        exe: format!("\"{exe}\""),
+        launch_options,
         last_play_time: 0,
         tags: args.strings("tags").unwrap_or_default(),
     };

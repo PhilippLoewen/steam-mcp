@@ -14,7 +14,7 @@ use crate::steam::compat::{get_all_proton_version_mappings, get_installed_proton
 use crate::steam::library::{LibraryFolder, get_libraries};
 use crate::steam::manifests::{AppManifest, read_all_manifests};
 use crate::steam::paths::{get_steam_dir, get_user_data_dir};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{dir_size, format_bytes, io_error, js_num, locale_cmp, num, read_text, sorted_entries};
 use crate::vdf::{VdfExt, VdfValue, js_entries, parse_int, parse_vdf};
 
@@ -32,6 +32,9 @@ pub fn tool() -> Tool {
             Param::new("limit", ParamType::Number),
         ],
         handler: |args| boxed(async move { handle(&args) }),
+        writes: &[Write::Action("backup")],
+        destructive: false,
+        open_world: false,
     }
 }
 

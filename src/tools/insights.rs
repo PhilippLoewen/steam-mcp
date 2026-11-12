@@ -16,7 +16,7 @@ use crate::steam::api::{HTTP, steam_api_request};
 use crate::steam::manifests::read_all_manifests;
 use crate::steam::paths::get_user_config;
 use crate::steam::userdata::get_all_playtimes;
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{
     format_playtime, format_timestamp, io_error, js_num, js_sort, locale_cmp, now_seconds, num, to_fixed,
 };
@@ -45,6 +45,9 @@ pub fn tool() -> Tool {
             Param::new("include_achievements", ParamType::Boolean),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[Write::Action("export")],
+        destructive: false,
+        open_world: true,
     }
 }
 

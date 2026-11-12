@@ -3,6 +3,7 @@
 pub mod api;
 pub mod categories;
 pub mod compat;
+pub mod launch_options;
 pub mod library;
 pub mod manifests;
 pub mod millennium;

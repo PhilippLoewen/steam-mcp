@@ -39,6 +39,9 @@ pub fn tool() -> Tool {
             Param::new("filter", ParamType::Enum(&["recent", "updated", "all"])),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[],
+        destructive: false,
+        open_world: true,
     }
 }
 

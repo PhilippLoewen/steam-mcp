@@ -26,6 +26,9 @@ pub fn tool() -> Tool {
             Param::new("steamid", ParamType::String),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[],
+        destructive: false,
+        open_world: true,
     }
 }
 

@@ -7,9 +7,10 @@ use anyhow::{Result, bail};
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 
+use crate::steam::launch_options::{check_launch_options, check_mangohud_setting};
 use crate::steam::paths::is_steam_running;
 use crate::steam::userdata::{get_app_launch_options, get_local_config, set_app_launch_options};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{backup_file, home_dir, io_error, js_num, num, read_text, write_atomic};
 use crate::vdf::{VdfObject, VdfValue, is_array_index, js_entries};
 
@@ -105,6 +106,14 @@ pub fn tool() -> Tool {
             Param::new("settings", ParamType::String),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[
+            Write::Action("set_launch_opts"),
+            Write::Param("preset"),
+            Write::Value("mangohud_action", "set"),
+            Write::Value("mangohud_action", "reset"),
+        ],
+        destructive: true,
+        open_world: false,
     }
 }
 
@@ -166,6 +175,13 @@ fn set_launch_opts(args: &Args) -> Result<ToolResult> {
     let Some(options) = args.str("options") else {
         return Ok(ToolResult::error("The \"options\" parameter is required for set_launch_opts."));
     };
+    if let Err(why) = check_launch_options(&options) {
+        return Ok(ToolResult::error(format!(
+            "Launch options were NOT modified: {why}.\nAccepted are game arguments, or \
+             [VAR=value …] [wrapper …] %command% [game arguments …] with listed variables and wrappers. \
+             For anything else, set the launch options in Steam's game properties yourself."
+        )));
+    }
     if is_steam_running() {
         return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
     }
@@ -310,6 +326,14 @@ fn mangohud(args: &Args) -> Result<ToolResult> {
     });
     let (scope, config_path) = game.clone().unwrap_or_else(|| ("global".to_string(), global_path.clone()));
 
+    if game.is_some() && mango_action != "show" {
+        return Ok(ToolResult::error(
+            "MangoHud can't apply per-game settings by Steam appid: it finds per-game configs by the \
+             running program's name, so a file named after the appid is never read. Leave out appid to \
+             change the global config.",
+        ));
+    }
+
     match mango_action.as_str() {
         "show" => {
             let mut configs = vec![mangohud_config("global", &global_path)?];
@@ -331,12 +355,14 @@ fn mangohud(args: &Args) -> Result<ToolResult> {
                 if trimmed.is_empty() {
                     continue;
                 }
-                match trimmed.find('=') {
-                    None => new_settings.insert(trimmed.to_string(), String::new()),
-                    Some(i) => {
-                        new_settings.insert(trimmed[..i].trim().to_string(), trimmed[i + 1..].trim().to_string())
-                    }
+                let (key, value) = match trimmed.find('=') {
+                    None => (trimmed, ""),
+                    Some(i) => (trimmed[..i].trim(), trimmed[i + 1..].trim()),
                 };
+                if let Err(why) = check_mangohud_setting(key, value) {
+                    return Ok(ToolResult::error(format!("MangoHud config NOT modified: {why}.")));
+                }
+                new_settings.insert(key.to_string(), value.to_string());
             }
 
             let existing = if config_path.exists() { Some(read_text(&config_path)?) } else { None };
@@ -472,6 +498,13 @@ fn steam_settings() -> Result<ToolResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presets_pass_the_launch_option_check() {
+        for preset in PRESETS {
+            assert_eq!(check_launch_options(preset.options), Ok(()), "{}", preset.name);
+        }
+    }
 
     #[test]
     fn merges_launch_options_like_ts() {

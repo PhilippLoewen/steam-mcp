@@ -18,7 +18,7 @@ use crate::steam::millennium::{
 };
 use crate::steam::paths::{get_user_config, is_steam_running};
 use crate::steam::userdata::get_all_playtimes;
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{format_bytes, format_playtime, format_timestamp, locale_cmp, now_seconds};
 
 const ACTIONS: &[&str] = &[
@@ -48,6 +48,15 @@ pub fn tool() -> Tool {
                 .describe("Include deleted categories (for \"categories\")"),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[
+            Write::Action("category_add"),
+            Write::Action("category_remove"),
+            Write::Action("category_create"),
+            Write::Action("category_rename"),
+            Write::Action("category_delete"),
+        ],
+        destructive: true,
+        open_world: true,
     }
 }
 
