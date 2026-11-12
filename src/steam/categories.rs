@@ -15,7 +15,8 @@ use anyhow::Result;
 use rand::Rng;
 use serde_json::{Map, Value, json};
 
-use super::paths::{get_steam_dir, get_user_config, is_steam_running};
+use super::paths::{get_steam_dir, get_user_config, steam_may_be_running};
+use crate::util::write_atomic;
 
 pub const KEY_PREFIX: &str = "user-collections.";
 
@@ -170,15 +171,22 @@ pub fn find_category<'a>(categories: &'a [Category], query: &str) -> Option<&'a 
         .or_else(|| categories.iter().find(|c| c.key.to_lowercase() == q))
 }
 
+const NAMESPACE_FILE: &str = "config/cloudstorage/cloud-storage-namespace-1.json";
+
+/// The active account's namespace file, whether it exists or not.
+fn active_categories_file() -> Result<PathBuf> {
+    Ok(get_steam_dir()?.join("userdata").join(get_user_config()?.steam_id32.to_string()).join(NAMESPACE_FILE))
+}
+
 /// The active account's namespace file, else the first account that has one.
+/// For reading only: edits go to the active account's file or nowhere.
 pub fn find_categories_file() -> Option<PathBuf> {
     let userdata = get_steam_dir().ok()?.join("userdata");
-    let rel = Path::new("config/cloudstorage/cloud-storage-namespace-1.json");
-    if let Ok(user) = get_user_config() {
-        let active = userdata.join(user.steam_id32.to_string()).join(rel);
-        if active.exists() {
-            return Some(active);
-        }
+    let rel = Path::new(NAMESPACE_FILE);
+    if let Ok(active) = active_categories_file()
+        && active.exists()
+    {
+        return Some(active);
     }
     let accounts = crate::util::read_dir_names(&userdata).ok()?;
     accounts
@@ -186,6 +194,16 @@ pub fn find_categories_file() -> Option<PathBuf> {
         .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
         .map(|d| userdata.join(d).join(rel))
         .find(|c| c.exists())
+}
+
+/// The active account's live categories; None when it has no namespace file.
+/// For checking what an edit did, which went to that account.
+pub fn read_active_categories() -> Result<Option<Vec<Category>>> {
+    let file = active_categories_file()?;
+    if !file.exists() {
+        return Ok(None);
+    }
+    Ok(Some(parse_categories(&crate::util::read_text(&file)?, false)))
 }
 
 /// Categories from disk; None when there is no namespace file.
@@ -236,12 +254,30 @@ pub fn random_collection_id() -> String {
     (0..12).map(|_| ID_ALPHABET[rng.random_range(0..ID_ALPHABET.len())] as char).collect()
 }
 
-/// Strict counterpart of parse_categories: a file we can't parse must not be rewritten.
+/// Strict counterpart of parse_categories: a file we can't parse, or one with a
+/// key listed twice (which entry Steam uses is unclear), must not be rewritten.
 fn load_pairs(raw: &str) -> Result<Vec<Value>> {
-    match serde_json::from_str::<Value>(raw) {
-        Err(_) => refuse("cloud-storage-namespace-1.json is not valid JSON; nothing was changed"),
-        Ok(Value::Array(pairs)) => Ok(pairs),
-        Ok(_) => refuse("cloud-storage-namespace-1.json is not a JSON array; nothing was changed"),
+    let pairs = match serde_json::from_str::<Value>(raw) {
+        Err(_) => return refuse("cloud-storage-namespace-1.json is not valid JSON; nothing was changed"),
+        Ok(Value::Array(pairs)) => pairs,
+        Ok(_) => return refuse("cloud-storage-namespace-1.json is not a JSON array; nothing was changed"),
+    };
+    let mut seen = HashSet::new();
+    for key in pairs.iter().filter_map(|p| p.as_array().and_then(|a| a.first()).and_then(Value::as_str)) {
+        if !seen.insert(key) {
+            return refuse(format!("cloud-storage-namespace-1.json lists {key} twice; nothing was changed"));
+        }
+    }
+    Ok(pairs)
+}
+
+/// The object entry of `key`, which the category resolved from this file had.
+fn entry_mut<'a>(pairs: &'a mut [Value], key: &str) -> Result<(usize, &'a mut Map<String, Value>)> {
+    let malformed = || refuse(format!("Entry {key} is missing or malformed; nothing was changed"));
+    let Some(index) = pair_index(pairs, key) else { return malformed() };
+    match pairs[index].get_mut(1).and_then(Value::as_object_mut) {
+        Some(meta) => Ok((index, meta)),
+        None => malformed(),
     }
 }
 
@@ -309,8 +345,7 @@ fn clean_name(name: &str) -> Result<String> {
 /// timestamp. Every other field and entry is kept as-is.
 fn update_value(raw: &str, key: &str, now: i64, mutate: impl FnOnce(&mut Map<String, Value>)) -> Result<CategoryEdit> {
     let mut pairs = load_pairs(raw)?;
-    let index = pair_index(&pairs, key).expect("resolved categories come from this file");
-    let meta = pairs[index][1].as_object_mut().expect("parse_categories only yields object entries");
+    let (_, meta) = entry_mut(&mut pairs, key)?;
     let Some(Value::String(before)) = meta.get("value").cloned() else {
         return refuse(format!("Entry {key} has no value to edit"));
     };
@@ -451,8 +486,8 @@ pub fn delete_category(raw: &str, query: &str, now: i64) -> Result<CategoryEdit>
     let category = resolve_category(raw, query)?;
     assert_not_special(&category, "deleted")?;
     let mut pairs = load_pairs(raw)?;
-    let index = pair_index(&pairs, &category.key).expect("resolved from this file");
-    let version = pairs[index].get(1).and_then(|m| m.get("version")).cloned();
+    let (index, meta) = entry_mut(&mut pairs, &category.key)?;
+    let version = meta.get("version").cloned();
     let mut tombstone = Map::new();
     tombstone.insert("key".into(), category.key.clone().into());
     tombstone.insert("timestamp".into(), now.into());
@@ -462,16 +497,6 @@ pub fn delete_category(raw: &str, query: &str, now: i64) -> Result<CategoryEdit>
     }
     pairs[index] = json!([category.key, tombstone]);
     Ok(CategoryEdit::plain(stringify(&pairs), category.key, true))
-}
-
-fn write_atomic(file: &Path, content: &str) -> Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp-{}", file.display(), std::process::id()));
-    let result = fs::write(&tmp, content).and_then(|()| fs::rename(&tmp, file));
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(err.into());
-    }
-    Ok(())
 }
 
 /// Write new namespace text: back the old file up to .bak, replace it
@@ -497,19 +522,19 @@ pub fn write_categories_file(file: &Path, raw: &str, key: &str) -> Result<()> {
     // be replaced by the cloud copy.
     if !keys.iter().any(|k| k.as_str() == Some(key)) {
         keys.push(key.into());
-        write_atomic(&modified_path, &Value::Array(keys).to_string())?;
+        write_atomic(&modified_path, Value::Array(keys).to_string().as_bytes())?;
     }
     let mut bak = file.as_os_str().to_owned();
     bak.push(".bak");
     fs::copy(file, PathBuf::from(bak))?;
-    write_atomic(file, raw)
+    Ok(write_atomic(file, raw.as_bytes())?)
 }
 
 /// The refusal for file edits under a running Steam. `bridge_status` says why
 /// the Millennium bridge couldn't take the edit instead, when known.
 pub fn steam_running_error(bridge_status: Option<&str>) -> CategoryError {
     let mut lines = vec![
-        "WARNING: Steam is currently running!".to_string(),
+        "WARNING: Steam is currently running (or that couldn't be checked)!".to_string(),
         "Steam keeps categories in memory and overwrites cloud-storage-namespace-1.json when it exits.".to_string(),
         "Please close Steam first, then try again, or install the steam-mcp-bridge Millennium plugin".to_string(),
         "(millennium-plugin/ in the steam-mcp repo) to edit categories while Steam runs.".to_string(),
@@ -523,12 +548,17 @@ pub fn steam_running_error(bridge_status: Option<&str>) -> CategoryError {
 }
 
 /// Run an edit against the active account's namespace file and write the
-/// result. Refuses while Steam runs: it would overwrite the file from memory on exit.
+/// result. Never falls back to another account's file. Refuses while Steam
+/// runs (or that can't be told): it would overwrite the file from memory on exit.
 pub fn edit_categories(edit: impl FnOnce(&str) -> Result<CategoryEdit>) -> Result<CategoryEdit> {
-    let Some(file) = find_categories_file() else {
-        return refuse("No cloud-storage-namespace-1.json found. Open the Steam library once so Steam creates it.");
-    };
-    if is_steam_running() {
+    let file = active_categories_file()?;
+    if !file.exists() {
+        return refuse(format!(
+            "The active Steam account has no {} yet. Open the Steam library once so Steam creates it.",
+            file.display()
+        ));
+    }
+    if steam_may_be_running() {
         return Err(steam_running_error(None).into());
     }
     let _guard = crate::util::file_edit_lock();
@@ -833,6 +863,24 @@ mod tests {
         assert!(err(create_category(&fixture(), "rpg", NOW, "x")).contains("already exists"));
         assert!(err(create_category(&fixture(), "hidden", NOW, "x")).contains("reserved"));
         err(create_category(&fixture(), "   ", NOW, "x"));
+    }
+
+    #[test]
+    fn a_key_listed_twice_is_refused_not_a_panic() {
+        let value = json!({ "id": "uc-x", "name": "X", "added": [] }).to_string();
+        let raw = json!([
+            ["user-collections.uc-x", null],
+            ["user-collections.uc-x", { "key": "user-collections.uc-x", "value": value }]
+        ])
+        .to_string();
+        for result in [
+            rename_category(&raw, "X", "Y", NOW),
+            delete_category(&raw, "X", NOW),
+            create_category(&raw, "Z", NOW, "abc"),
+        ] {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("twice"), "{err}");
+        }
     }
 
     #[test]

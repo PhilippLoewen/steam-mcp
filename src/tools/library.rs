@@ -8,17 +8,17 @@ use serde_json::{Map, Value, json};
 use crate::steam::api::{has_api_key, steam_api_request, store_api_request};
 use crate::steam::categories::{
     Category, CategoryEdit, CategoryError, KEY_PREFIX, add_apps, create_category, delete_category, edit_categories,
-    find_category, parse_categories, random_collection_id, read_categories, remove_apps, rename_category,
-    steam_running_error,
+    find_category, parse_categories, random_collection_id, read_active_categories, read_categories, remove_apps,
+    rename_category, steam_running_error,
 };
 use crate::steam::library::get_libraries;
 use crate::steam::manifests::read_all_manifests;
 use crate::steam::millennium::{
     BridgeOptions, BridgeOutcome, BridgeRequest, bridge_category, run_bridge_edit, verify_bridge_edit,
 };
-use crate::steam::paths::{get_user_config, is_steam_running};
+use crate::steam::paths::{get_user_config, steam_may_be_running};
 use crate::steam::userdata::get_all_playtimes;
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{format_bytes, format_playtime, format_timestamp, locale_cmp, now_seconds};
 
 const ACTIONS: &[&str] = &[
@@ -48,6 +48,15 @@ pub fn tool() -> Tool {
                 .describe("Include deleted categories (for \"categories\")"),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[
+            Write::Action("category_add"),
+            Write::Action("category_remove"),
+            Write::Action("category_create"),
+            Write::Action("category_rename"),
+            Write::Action("category_delete"),
+        ],
+        destructive: true,
+        open_world: true,
     }
 }
 
@@ -56,6 +65,7 @@ pub trait CategoryEnv {
     fn steam_running(&self) -> bool;
     async fn bridge(&self, request: &BridgeRequest) -> Result<BridgeOutcome>;
     fn edit_file(&self, edit: &(dyn Fn(&str) -> Result<CategoryEdit> + Sync)) -> Result<CategoryEdit>;
+    /// The active account's categories, to check a bridge edit against.
     fn read_categories(&self) -> Result<Option<Vec<Category>>>;
     async fn app_names(&self, appids: &[i64]) -> HashMap<i64, String>;
 }
@@ -65,7 +75,7 @@ pub struct LiveEnv;
 
 impl CategoryEnv for LiveEnv {
     fn steam_running(&self) -> bool {
-        is_steam_running()
+        steam_may_be_running()
     }
 
     async fn bridge(&self, request: &BridgeRequest) -> Result<BridgeOutcome> {
@@ -77,7 +87,7 @@ impl CategoryEnv for LiveEnv {
     }
 
     fn read_categories(&self) -> Result<Option<Vec<Category>>> {
-        read_categories(false)
+        read_active_categories()
     }
 
     async fn app_names(&self, appids: &[i64]) -> HashMap<i64, String> {
@@ -160,7 +170,16 @@ pub struct MembershipFields {
 /// file shows. Still an error when the file doesn't show it done: Steam may
 /// not have saved it yet, or the edit never ran.
 async fn read_back_bridge_edit(env: &impl CategoryEnv, request: &BridgeRequest, timeout: &str) -> ToolResult {
-    let categories = env.read_categories().ok().flatten().unwrap_or_default();
+    // A file that can't be read proves nothing, least of all that a category is gone.
+    let categories = match env.read_categories() {
+        Ok(Some(categories)) => categories,
+        Ok(None) | Err(_) => {
+            return ToolResult::error(format!(
+                "{timeout} The categories file couldn't be read to check it, so whether the edit was \
+                 applied is unknown; check again before retrying."
+            ));
+        }
+    };
     let (applied, category) = verify_bridge_edit(request, &categories);
     if !applied {
         return ToolResult::error(format!(
@@ -442,7 +461,8 @@ mod tests {
         running: bool,
         bridge: Mutex<Option<Result<BridgeOutcome>>>,
         file: Mutex<Option<CategoryEdit>>,
-        categories: Vec<Category>,
+        /// None: the categories file can't be read.
+        categories: Option<Vec<Category>>,
         bridge_calls: Mutex<usize>,
         file_calls: Mutex<usize>,
     }
@@ -453,7 +473,7 @@ mod tests {
                 running,
                 bridge: Mutex::new(None),
                 file: Mutex::new(None),
-                categories: Vec::new(),
+                categories: Some(Vec::new()),
                 bridge_calls: Mutex::new(0),
                 file_calls: Mutex::new(0),
             }
@@ -476,7 +496,7 @@ mod tests {
         }
 
         fn read_categories(&self) -> Result<Option<Vec<Category>>> {
-            Ok(Some(self.categories.clone()))
+            Ok(self.categories.clone())
         }
 
         async fn app_names(&self, _appids: &[i64]) -> HashMap<i64, String> {
@@ -603,7 +623,7 @@ mod tests {
         })
     }
 
-    fn timed_out(categories: Vec<Category>) -> FakeEnv {
+    fn timed_out(categories: Option<Vec<Category>>) -> FakeEnv {
         FakeEnv {
             bridge: Mutex::new(Some(Err(CategoryError::timeout("The plugin did not answer within 15s.").into()))),
             categories,
@@ -614,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_reports_applied_when_the_file_shows_it() {
         let add = BridgeRequest::Add { name: "RPG".into(), appids: vec![440] };
-        let env = timed_out(vec![rpg(&[10, 440])]);
+        let env = timed_out(Some(vec![rpg(&[10, 440])]));
         let out = parsed(&run_category_edit(&env, "category_add", &add, &file_edit, None).await);
         assert_eq!(out["via"], "millennium");
         assert_eq!(out["verifiedByReadback"], true);
@@ -625,9 +645,18 @@ mod tests {
     #[tokio::test]
     async fn timeout_stays_an_error_when_the_file_does_not_show_it() {
         let add = BridgeRequest::Add { name: "RPG".into(), appids: vec![440] };
-        let env = timed_out(vec![rpg(&[10])]);
+        let env = timed_out(Some(vec![rpg(&[10])]));
         let result = run_category_edit(&env, "category_add", &add, &file_edit, None).await;
         assert!(result.is_error);
         assert!(result.text.contains("did not answer") && result.text.contains("doesn't show it yet"));
+    }
+
+    #[tokio::test]
+    async fn timeout_with_an_unreadable_file_is_not_a_verified_delete() {
+        let delete = BridgeRequest::Delete { name: "RPG".into() };
+        let env = timed_out(None);
+        let result = run_category_edit(&env, "category_delete", &delete, &file_edit, None).await;
+        assert!(result.is_error, "{}", result.text);
+        assert!(result.text.contains("couldn't be read"), "{}", result.text);
     }
 }

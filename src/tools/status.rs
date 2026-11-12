@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::steam::manifests::read_all_manifests;
-use crate::steam::paths::{get_library_folders, get_user_config, is_steam_running};
+use crate::steam::paths::{SteamState, get_library_folders, get_user_config, steam_state};
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
 use crate::util::{format_bytes, read_dir_names, to_fixed};
 use crate::vdf::{VdfValue, parse_int, parse_vdf};
@@ -17,6 +17,9 @@ pub fn tool() -> Tool {
             Param::new("action", ParamType::Enum(&["status", "queue", "progress"])).default("status"),
             Param::new("appid", ParamType::Number),
         ],
+        writes: &[],
+        destructive: false,
+        open_world: false,
         handler: |args| {
             boxed(async move {
                 match args.str("action").as_deref() {
@@ -66,7 +69,12 @@ fn status() -> ToolResult {
         .map(|c| json!({ "accountName": c.account_name, "personaName": c.persona_name, "steamId64": c.steam_id64 }));
     let installed = read_all_manifests().map(|m| m.len()).unwrap_or(0);
     ToolResult::json(&json!({
-        "steamRunning": is_steam_running(),
+        // null when the process list couldn't be read.
+        "steamRunning": match steam_state() {
+            SteamState::Running => Value::Bool(true),
+            SteamState::NotRunning => Value::Bool(false),
+            SteamState::Unknown => Value::Null,
+        },
         "currentUser": user,
         "installedGames": installed,
     }))

@@ -212,6 +212,121 @@ pub fn file_edit_lock() -> std::sync::MutexGuard<'static, ()> {
     FILE_EDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Replace `file` with `content` without ever leaving it half-written: write a
+/// sibling temp file, flush it to disk and rename it over `file`. An existing
+/// file's permissions carry over. When `file` is a symlink, its target is
+/// replaced and the link stays.
+pub fn write_atomic(file: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let file = match fs::symlink_metadata(file) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(file)?,
+        _ => file.to_path_buf(),
+    };
+    let permissions = match fs::metadata(&file) {
+        Ok(meta) => Some(meta.permissions()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let mut tmp = file.as_os_str().to_owned();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let _ = fs::remove_file(&tmp);
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Replacing a file: nothing but the owner may read the content before
+        // its permissions are copied over. A new file gets the usual 0666 & !umask.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, if permissions.is_some() { 0o600 } else { 0o666 });
+        let mut out = options.open(&tmp)?;
+        if let Some(permissions) = permissions {
+            out.set_permissions(permissions)?;
+        }
+        out.write_all(content)?;
+        out.sync_all()?;
+        fs::rename(&tmp, &file)?;
+        sync_parent(&file);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Flush `path`'s directory entry to disk, so a rename survives a power loss.
+/// Best effort: not every platform or filesystem supports it.
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = fs::File::open(if dir.as_os_str().is_empty() { Path::new(".") } else { dir })
+    {
+        let _ = dir.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Backups of one file that `backup_file` keeps; older ones are deleted.
+const BACKUPS_KEPT: usize = 5;
+
+/// The timestamp in backup names, in UTC so names sort in creation order
+/// across DST changes: `20261112T153000.123456789Z`.
+const BACKUP_STAMP: &str = "%Y%m%dT%H%M%S%.9fZ";
+
+/// Whether `stamp` is exactly what BACKUP_STAMP produces.
+fn is_backup_stamp(stamp: &str) -> bool {
+    stamp.len() == 26
+        && stamp.char_indices().all(|(i, c)| match i {
+            8 => c == 'T',
+            15 => c == '.',
+            25 => c == 'Z',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// Copy `file` to `<file>.<UTC timestamp>.bak` before an edit, keeping the
+/// newest few, so a run of edits can't overwrite the only copy of the
+/// original. Other `.bak` files are never touched. Does nothing when `file`
+/// doesn't exist.
+pub fn backup_file(file: &Path) -> std::io::Result<()> {
+    if !file.exists() {
+        return Ok(());
+    }
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else { return Ok(()) };
+    let name = name.to_string_lossy();
+    let mut time = chrono::Utc::now();
+    let backup = loop {
+        let candidate = dir.join(format!("{name}.{}.bak", time.format(BACKUP_STAMP)));
+        if !candidate.exists() {
+            break candidate;
+        }
+        time += chrono::Duration::nanoseconds(1);
+    };
+    fs::copy(file, &backup)?;
+    // Best effort: Windows can't flush a file opened read-only.
+    if let Ok(copy) = fs::File::open(&backup) {
+        let _ = copy.sync_all();
+    }
+    sync_parent(&backup);
+
+    // Keep the new backup whatever its name says (the clock may have gone back),
+    // plus the newest others.
+    let prefix = format!("{name}.");
+    let new_name = backup.file_name().map(|n| n.to_string_lossy().into_owned());
+    let mut others: Vec<String> = read_dir_names(dir)?
+        .into_iter()
+        .filter(|n| Some(n) != new_name.as_ref())
+        .filter(|n| n.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix(".bak")).is_some_and(is_backup_stamp))
+        .collect();
+    others.sort();
+    for old in &others[..others.len().saturating_sub(BACKUPS_KEPT - 1)] {
+        // Pruning only tidies up; the new backup exists, so the edit may go ahead.
+        let _ = fs::remove_file(dir.join(old));
+    }
+    Ok(())
+}
+
 /// The user's home directory.
 pub fn home_dir() -> PathBuf {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_default()
@@ -279,5 +394,80 @@ mod tests {
         assert_eq!(to_fixed(f64::INFINITY, 2), "Infinity");
         assert_eq!(format_playtime(f64::NAN), "NaN hours");
         assert_eq!(format_bytes(f64::NAN), "NaN B");
+    }
+
+    #[test]
+    fn write_atomic_replaces_content_and_keeps_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        fs::write(&file, "old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+            write_atomic(&file, b"new").unwrap();
+            assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        write_atomic(&file, b"newer").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "newer");
+        assert_eq!(read_dir_names(dir.path()).unwrap(), ["f.txt"]);
+    }
+
+    #[test]
+    fn backup_file_keeps_the_newest_few() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.vdf");
+        backup_file(&file).unwrap();
+        assert!(read_dir_names(dir.path()).unwrap().is_empty());
+
+        let foreign = ["f.vdf.bak", "f.vdf.2020-before-migration.bak", "f.vdf.20200101T000000.000000000Z.bak.old"];
+        for name in foreign {
+            fs::write(dir.path().join(name), "made elsewhere").unwrap();
+        }
+        // An old generated backup, so pruning has to rank it by name, not by when it was made.
+        fs::write(dir.path().join("f.vdf.20000101T000000.000000000Z.bak"), "ancient").unwrap();
+        for i in 0..BACKUPS_KEPT + 2 {
+            fs::write(&file, i.to_string()).unwrap();
+            backup_file(&file).unwrap();
+        }
+        let names = read_dir_names(dir.path()).unwrap();
+        let backups: Vec<&String> = names
+            .iter()
+            .filter(|n| n.strip_prefix("f.vdf.").and_then(|r| r.strip_suffix(".bak")).is_some_and(is_backup_stamp))
+            .collect();
+        assert_eq!(backups.len(), BACKUPS_KEPT);
+        assert_eq!(fs::read_to_string(dir.path().join(backups[0])).unwrap(), "2");
+        assert_eq!(fs::read_to_string(dir.path().join(backups[4])).unwrap(), (BACKUPS_KEPT + 1).to_string());
+        for name in foreign {
+            assert!(names.contains(&name.to_string()), "{name}");
+        }
+    }
+
+    #[test]
+    fn backup_file_keeps_the_new_backup_when_the_clock_went_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.vdf");
+        for i in 0..BACKUPS_KEPT {
+            fs::write(dir.path().join(format!("f.vdf.2999010{i}T000000.000000000Z.bak")), "future").unwrap();
+        }
+        fs::write(&file, "current").unwrap();
+        backup_file(&file).unwrap();
+        let names = read_dir_names(dir.path()).unwrap();
+        let backups: Vec<&String> = names.iter().filter(|n| n.ends_with(".bak")).collect();
+        assert_eq!(backups.len(), BACKUPS_KEPT);
+        assert!(backups.iter().any(|n| fs::read_to_string(dir.path().join(n)).unwrap() == "current"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.conf");
+        let link = dir.path().join("link.conf");
+        fs::write(&target, "old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
     }
 }

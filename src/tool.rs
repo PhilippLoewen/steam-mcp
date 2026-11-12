@@ -44,6 +44,8 @@ pub enum ParamType {
     ArrayOfStrings,
     ArrayOfNumbers,
     ArrayOfIntegers,
+    /// A SteamID64: exactly 17 digits. It goes into Web API URLs, so nothing else is accepted.
+    SteamId,
 }
 
 #[derive(Debug, Clone)]
@@ -75,15 +77,20 @@ impl Param {
         self
     }
 
-    fn schema(&self) -> Value {
+    /// The JSON Schema, leaving out the enum values in `hidden`.
+    fn schema(&self, hidden: &[&str]) -> Value {
         let mut s = match self.ty {
             ParamType::String => json!({ "type": "string" }),
             ParamType::Number => json!({ "type": "number" }),
             ParamType::Boolean => json!({ "type": "boolean" }),
-            ParamType::Enum(values) => json!({ "type": "string", "enum": values }),
+            ParamType::Enum(values) => {
+                let shown: Vec<&str> = values.iter().copied().filter(|v| !hidden.contains(v)).collect();
+                json!({ "type": "string", "enum": shown })
+            }
             ParamType::ArrayOfStrings => json!({ "type": "array", "items": { "type": "string" } }),
             ParamType::ArrayOfNumbers => json!({ "type": "array", "items": { "type": "number" } }),
             ParamType::ArrayOfIntegers => json!({ "type": "array", "items": { "type": "integer" } }),
+            ParamType::SteamId => json!({ "type": "string", "pattern": "^[0-9]{17}$" }),
         };
         let obj = s.as_object_mut().expect("object");
         if let Some(d) = &self.default {
@@ -115,6 +122,9 @@ impl Param {
             ParamType::ArrayOfStrings => value.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
             ParamType::ArrayOfNumbers => value.as_array().is_some_and(|a| a.iter().all(Value::is_number)),
             ParamType::ArrayOfIntegers => value.as_array().is_some_and(|a| a.iter().all(is_int)),
+            ParamType::SteamId => {
+                value.as_str().is_some_and(|s| s.len() == 17 && s.bytes().all(|b| b.is_ascii_digit()))
+            }
         };
         if ok {
             Ok(())
@@ -131,6 +141,7 @@ impl Param {
             ParamType::ArrayOfStrings => "array of strings",
             ParamType::ArrayOfNumbers => "array of numbers",
             ParamType::ArrayOfIntegers => "array of integers",
+            ParamType::SteamId => "a SteamID64 (17 digits)",
         }
     }
 }
@@ -147,17 +158,69 @@ fn js_type(v: &Value) -> &'static str {
     }
 }
 
+/// What makes a call a write action: one that changes a file, changes
+/// Steam's state or starts a program. Read-only mode hides and refuses these.
+#[derive(Debug, Clone, Copy)]
+pub enum Write {
+    /// The `action` parameter has this value.
+    Action(&'static str),
+    /// The enum parameter `.0` has the value `.1`.
+    Value(&'static str, &'static str),
+    /// The parameter is given and not an empty string.
+    Param(&'static str),
+}
+
 pub struct Tool {
     pub name: &'static str,
     pub description: &'static str,
     pub params: Vec<Param>,
     pub handler: fn(Args) -> ToolFuture,
+    /// Empty for a tool that only reads.
+    pub writes: &'static [Write],
+    /// Whether a write action can delete or replace something.
+    pub destructive: bool,
+    /// Whether the tool talks to web services.
+    pub open_world: bool,
 }
 
 impl Tool {
-    pub fn input_schema(&self) -> Map<String, Value> {
-        let properties: Map<String, Value> = self.params.iter().map(|p| (p.name.to_string(), p.schema())).collect();
-        let required: Vec<&str> = self.params.iter().filter(|p| p.required).map(|p| p.name).collect();
+    /// The enum values of `param` that make a call a write action.
+    fn write_values(&self, param: &str) -> Vec<&'static str> {
+        self.writes
+            .iter()
+            .filter_map(|w| match *w {
+                Write::Action(v) if param == "action" => Some(v),
+                Write::Value(p, v) if p == param => Some(v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn is_write(&self, args: &Args) -> bool {
+        self.writes.iter().any(|w| match *w {
+            Write::Action(v) => args.str("action").as_deref() == Some(v),
+            Write::Value(p, v) => args.str(p).as_deref() == Some(v),
+            // An empty string means "not given" to the handlers (`preset: ""` lists presets).
+            Write::Param(p) => args.value(p).is_some_and(|v| v.as_str() != Some("")),
+        })
+    }
+
+    /// The JSON Schema of the arguments; in read-only mode without the write
+    /// actions and the parameters only they use.
+    pub fn input_schema(&self, read_only: bool) -> Map<String, Value> {
+        let params: Vec<&Param> = self
+            .params
+            .iter()
+            .filter(|p| !read_only || !self.writes.iter().any(|w| matches!(*w, Write::Param(n) if n == p.name)))
+            .collect();
+        let properties: Map<String, Value> = params
+            .iter()
+            .map(|p| {
+                let hidden = if read_only { self.write_values(p.name) } else { Vec::new() };
+                (p.name.to_string(), p.schema(&hidden))
+            })
+            .collect();
+        let required: Vec<&str> = params.iter().filter(|p| p.required).map(|p| p.name).collect();
         let mut schema = Map::new();
         schema.insert("type".into(), "object".into());
         schema.insert("properties".into(), properties.into());

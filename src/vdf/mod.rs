@@ -3,10 +3,14 @@
 mod binary;
 mod text;
 
-pub use binary::{parse_binary_vdf, serialize_binary_vdf};
-pub use text::{parse_vdf, serialize_vdf};
+pub use binary::{BinObject, BinValue, parse_binary_vdf, parse_binary_vdf_strict, serialize_binary_vdf};
+pub use text::{parse_vdf, parse_vdf_strict, serialize_vdf};
 
 use indexmap::IndexMap;
+
+/// Deepest object nesting either parser accepts. Steam's files stay far
+/// below it; the limit keeps hostile input from overflowing the stack.
+const MAX_DEPTH: usize = 64;
 
 /// A VDF object. Insertion order is kept so files round-trip in Steam's order.
 pub type VdfObject = IndexMap<String, VdfValue>;
@@ -108,8 +112,8 @@ pub fn is_array_index(key: &str) -> bool {
 
 /// Entries in JS `Object.entries` order: array-index keys ascending, then the
 /// rest in insertion order. Use this wherever iteration order reaches output.
-pub fn js_entries(obj: &VdfObject) -> Vec<(&str, &VdfValue)> {
-    let mut index: Vec<(u64, &str, &VdfValue)> = Vec::new();
+pub fn js_entries<V>(obj: &IndexMap<String, V>) -> Vec<(&str, &V)> {
+    let mut index: Vec<(u64, &str, &V)> = Vec::new();
     let mut rest = Vec::new();
     for (k, v) in obj {
         if is_array_index(k) {

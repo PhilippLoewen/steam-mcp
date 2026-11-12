@@ -109,6 +109,62 @@ Available categories and their tools:
 
 When unset, all categories are enabled (14 tools, ~3,200 tokens of context).
 
+### Read-only mode
+
+Several actions change your system: they edit Steam's config files, set launch options that run with your games, start installs or games, or write exports and backups. An assistant that reads text from the web (game news, reviews, workshop descriptions, PCGamingWiki) can be steered by instructions hidden in that text, so you may want to switch these actions off:
+
+```json
+{
+  "env": {
+    "STEAM_MCP_READONLY": "1"
+  }
+}
+```
+
+Any non-empty value except `0`, `false` or `no` (in any case) turns read-only mode on. The write actions are then left out of the tool list and refused if called anyway. They are:
+- `set_launch_opts`, applying a preset and MangoHud `set`/`reset`
+- the category edits
+- shortcuts `add`, `remove` and `import_lutris`
+- storage `backup` and insights `export`
+- game_control `install`, `uninstall`, `launch`, `verify` and `move`
+
+Every tool also carries MCP annotations (`readOnlyHint` and `openWorldHint`; tools that write also `destructiveHint`), so clients that support them can ask before a write.
+
+### Output folder
+
+`insights export` and `storage backup` write only inside one folder: `steam-mcp` in your Documents folder (`XDG_DOCUMENTS_DIR` on Linux, `~/Documents` on macOS and Windows). It is created the first time it's needed. Set `STEAM_MCP_OUTPUT_DIR` to an absolute path to use another folder. Tools only choose file names inside it, and nothing there is ever overwritten: an export refuses a name that is taken, and every backup goes into a new `saves-<time>` folder.
+
+> **Breaking change after 2.0.0:** backup no longer takes a `destination`, and export's `output` is now an optional file name inside the output folder rather than a path.
+
+### What the tools may write
+
+Launch options run through a shell when Steam starts the game, so `set_launch_opts` and new shortcuts only accept:
+- game arguments (`-novid -high`), or
+- `[VAR=value …] [wrapper …] %command% [game arguments …]`
+
+Wrappers are:
+- `mangohud`, optionally with `--dlsym`
+- `gamemoderun`, `prime-run` and `obs-gamecapture`
+- `strangle`, with a frame-rate limit
+- `gamescope`, with its size, refresh, scaling and display options, then `--`
+
+Variables must start with:
+- `PROTON_`, `DXVK_`, `VKD3D_`, `WINE_FULLSCREEN_`
+- `MANGOHUD`
+- `__NV_`, `__GLX_`, `__GL_`
+- `SDL_`, `STEAM_LINUX_RUNTIME_`, `RADV_`
+- `AMD_VULKAN_ICD`, `ENABLE_VKBASALT`
+
+Variable values can't contain paths. Variables that run a program or load a file are refused, such as `PROTON_REMOTE_DEBUG_CMD` and `MANGOHUD_CONFIGFILE`, and `MANGOHUD_CONFIG` follows the same rules as MangoHud `set` below. Quotes, `;`, `|`, `&`, `$`, backticks, redirections and anything else a shell would interpret are refused. For other launch options, set them in Steam's game properties yourself. Presets are built in and skip these checks; they are merged into the game's existing launch options.
+
+For `shortcuts add`, the program must be an existing executable, given by absolute path; a symlink is saved as the file it points to. On Linux and macOS, neither the program nor its start folder may be somewhere anyone can write to, such as `/tmp`. The program can't be a shell, interpreter, `wine`, terminal or other program that runs whatever its arguments say; this list is best effort, not a guarantee. On Windows, only `.exe` programs outside the temp folder are accepted. `import_lutris` doesn't take a program from the model: every imported shortcut runs `lutris` with the game's Lutris id.
+
+MangoHud `set` refuses the keys that run commands, write files or upload logs (`exec`, `output_folder`, `output_file`, `control`, `upload_log`, `upload_logs`, `permit_upload`). It works on the global config only, because MangoHud finds per-game configs by program name, not by Steam appid.
+
+Edits to `localconfig.vdf`, `shortcuts.vdf` and MangoHud configs are atomic. The previous version is kept as `<file>.<time>.bak`, and the newest five backups are kept. A `localconfig.vdf` or `shortcuts.vdf` that can't be read back exactly (damaged, cut off, not UTF-8) is left alone.
+
+Launch options, presets and shortcuts can only be changed while Steam is closed, because Steam rewrites those files from memory when it exits. Category edits while Steam runs need the [Millennium bridge](#editing-categories-while-steam-runs). To tell whether Steam runs, steam-mcp uses `pgrep` on Linux and macOS and `tasklist` on Windows. If that check fails, these edits are refused as if Steam were running. steam-mcp has to see Steam's processes: in a sandbox or container with its own process list, Steam looks closed and these edits are not refused.
+
 ### Prerequisites
 
 - Steam installed in the default location:
@@ -145,7 +201,7 @@ Each tool uses an `action` parameter to select the operation. 14 tools cover 66 
 | `category_rename` | Rename a category (`name`, `newName`) |
 | `category_delete` | Delete a category (`name`) |
 
-While Steam is **running**, category edits go through the [steam-mcp-bridge Millennium plugin](#editing-categories-while-steam-runs) when it is installed (the result then says `"via": "millennium"`); without it they are refused. While Steam is **closed**, edits write `userdata/<id>/config/cloudstorage/cloud-storage-namespace-1.json` (the old version is kept as `.bak`) and list the changed key in `cloud-storage-namespace-1.modified.json`, so Steam uploads it to the cloud on its next start. Dynamic (filter-based) collections can be renamed or deleted, but their games can't be edited by hand.
+While Steam is **running**, category edits go through the [steam-mcp-bridge Millennium plugin](#editing-categories-while-steam-runs) when it is installed (the result then says `"via": "millennium"`); without it they are refused. While Steam is **closed**, edits write `userdata/<id>/config/cloudstorage/cloud-storage-namespace-1.json` (the old version is kept as `.bak`) and list the changed key in `cloud-storage-namespace-1.modified.json`, so Steam uploads it to the cloud on its next start. Edits go to the signed-in account's file only and are refused if it has none yet. Dynamic (filter-based) categories can be renamed or deleted, but their games can't be edited by hand.
 
 #### Editing categories while Steam runs
 
@@ -157,12 +213,12 @@ bun install
 bun run build      # packs steam-mcp-bridge.star into the Millennium plugins folder
 ```
 
-Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talks to Millennium over `/tmp/millennium-mep.sock`; set `MILLENNIUM_MEP_SOCKET` if yours lives elsewhere (e.g. when the MCP server runs in a sandbox with a private `/tmp`). The bridge works on Linux and macOS; on Windows, category edits need Steam closed. Live edits only cover games Steam knows in this library, and renaming relies on a Steam client internal, so it reports an error if a Steam update breaks it.
+Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talks to Millennium over `/tmp/millennium-mep.sock`; set `MILLENNIUM_MEP_SOCKET` if yours lives elsewhere (e.g. when the MCP server runs in a sandbox with a private `/tmp`). The socket must belong to your user and be served by a process of your user; otherwise the bridge isn't used. The bridge works on Linux and macOS; on Windows, category edits need Steam closed. Live edits only cover games Steam knows in this library, and renaming relies on a Steam client internal, so it reports an error if a Steam update breaks it.
 
 ### `steam_status` — Steam client status
 | Action | Description |
 |--------|-------------|
-| `status` | Check if Steam is running |
+| `status` | Check if Steam is running (`steamRunning` is `null` when that can't be checked) |
 | `queue` | View current download queue |
 | `progress` | Check download progress for a game |
 
@@ -187,7 +243,7 @@ Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talk
 | `shader_stats` | Shader cache overview across all games |
 | `saves_list` | List local cloud save data per game |
 | `saves_stats` | Cloud save aggregate stats |
-| `backup` | Back up cloud saves to a directory |
+| `backup` | Back up cloud saves into a new folder in the [output folder](#output-folder) |
 
 ### `game_control` — Game actions
 | Action | Description |
@@ -203,9 +259,9 @@ Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talk
 | Action | Description |
 |--------|-------------|
 | `get_launch_opts` | Read current launch options |
-| `set_launch_opts` | Set launch options |
+| `set_launch_opts` | Set launch options ([accepted forms](#what-the-tools-may-write)) |
 | `presets` | List/apply launch option presets (MangoHud, GameMode, Vulkan, etc.) |
-| `mangohud` | Show, set, or reset MangoHud configuration |
+| `mangohud` | Show, set, or reset the global MangoHud configuration |
 | `steam_settings` | View Steam client settings |
 
 ### `player` — Player data (most actions require API key)
@@ -251,7 +307,7 @@ Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talk
 | `timeline` | Month-by-month gaming activity |
 | `year_review` | Annual gaming recap |
 | `play_history` | Full playtime history (installed + uninstalled games) |
-| `export` | Export library data as JSON or CSV |
+| `export` | Export library data as JSON or CSV into the [output folder](#output-folder) |
 
 ### `game_info` — Game content and metadata
 | Action | Description |
@@ -297,9 +353,10 @@ cargo clippy --all-targets
 ```
 src/
 ├── main.rs                  # Entry point: stdio transport, STEAM_TOOLS filtering
-├── server.rs                # MCP handler: tools/list and tools/call dispatch
-├── tool.rs                  # Tool/parameter specs, JSON Schema, argument validation
-├── util.rs                  # Formatting (bytes, playtime, timestamps), fs helpers, FileCache
+├── server.rs                # MCP handler: tools/list and tools/call, read-only mode, annotations
+├── tool.rs                  # Tool/parameter specs, JSON Schema, argument validation, write marks
+├── output.rs                # The output folder for exports and backups
+├── util.rs                  # Formatting, fs helpers (atomic writes, backups), FileCache
 ├── vdf/
 │   ├── text.rs              # Text VDF recursive descent parser + serializer
 │   └── binary.rs            # Binary VDF parser + writer (shortcuts.vdf)
@@ -309,6 +366,7 @@ src/
 │   ├── library.rs           # Library folder operations + disk info
 │   ├── userdata.rs          # localconfig.vdf read/write
 │   ├── compat.rs            # Proton/Wine compatibility tracking
+│   ├── launch_options.rs    # What launch options and shortcut programs may be set
 │   ├── workshop.rs          # Workshop manifest reading
 │   ├── shortcuts.rs         # Binary shortcuts.vdf read/write
 │   ├── categories.rs        # Library categories (cloud-storage-namespace-1.json) read/write

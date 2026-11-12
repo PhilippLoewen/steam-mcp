@@ -9,11 +9,12 @@ use anyhow::{Result, anyhow};
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 
+use crate::output;
 use crate::steam::compat::{get_all_proton_version_mappings, get_installed_proton_versions};
 use crate::steam::library::{LibraryFolder, get_libraries};
 use crate::steam::manifests::{AppManifest, read_all_manifests};
 use crate::steam::paths::{get_steam_dir, get_user_data_dir};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{dir_size, format_bytes, io_error, js_num, locale_cmp, num, read_text, sorted_entries};
 use crate::vdf::{VdfExt, VdfValue, js_entries, parse_int, parse_vdf};
 
@@ -27,11 +28,13 @@ pub fn tool() -> Tool {
         params: vec![
             Param::new("action", ParamType::Enum(ACTIONS)).required(),
             Param::new("appid", ParamType::Number),
-            Param::new("destination", ParamType::String).describe("Backup destination directory"),
             Param::new("sort_by", ParamType::Enum(&["name", "size"])),
             Param::new("limit", ParamType::Number),
         ],
         handler: |args| boxed(async move { handle(&args) }),
+        writes: &[Write::Action("backup")],
+        destructive: false,
+        open_world: false,
     }
 }
 
@@ -275,7 +278,9 @@ fn cleanup() -> Result<ToolResult> {
 
     Ok(ToolResult::json(&json!({
         "orphanedData": {
-            "description": "Data directories for uninstalled games. Safe to delete.",
+            "description": "Data directories for uninstalled games. Shader caches (shadercache) can be deleted safely. \
+                Proton prefixes (compatdata) can hold the only copy of saves and settings for games without \
+                Steam Cloud: back them up or check them before deleting.",
             "count": orphans.len(),
             "totalSize": fmt(orphans.iter().map(|o| o.size).sum()),
             "items": orphans.iter().take(20).map(Orphan::to_json).collect::<Vec<_>>(),
@@ -452,8 +457,10 @@ fn cp_einval(message: String, path: &Path) -> anyhow::Error {
     cp_error("EINVAL", message, path)
 }
 
-/// Node's `fs.cpSync(src, dest, { recursive: true })`: merges into existing
-/// directories, overwrites files, and recreates symlinks with absolute targets.
+/// Copy `src` to `dest`, which must not exist yet: nothing is merged into or
+/// replaced, so two source names that collide on the destination's filesystem
+/// fail instead of overwriting each other. Symlinks are recreated with
+/// absolute targets (copied as files where symlinks aren't available).
 fn copy_recursive(src: &Path, dest: &Path) -> Result<()> {
     let src_abs = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
     let dest_abs = std::path::absolute(dest).unwrap_or_else(|_| dest.to_path_buf());
@@ -474,17 +481,7 @@ fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(src).map_err(|e| io_error(&e, "lstat", src))?;
     let ft = meta.file_type();
     if ft.is_dir() {
-        match fs::symlink_metadata(dest) {
-            Ok(d) if !d.is_dir() => {
-                return Err(cp_error(
-                    "EISDIR",
-                    format!("cannot overwrite non-directory {} with directory {}", dest.display(), src.display()),
-                    dest,
-                ));
-            }
-            Ok(_) => {}
-            Err(_) => fs::create_dir(dest).map_err(|e| io_error(&e, "mkdir", dest))?,
-        }
+        fs::create_dir(dest).map_err(|e| io_error(&e, "mkdir", dest))?;
         for entry in fs::read_dir(src).map_err(|e| io_error(&e, "opendir", src))? {
             let entry = entry.map_err(|e| io_error(&e, "readdir", src))?;
             copy_entry(&entry.path(), &dest.join(entry.file_name()))?;
@@ -494,12 +491,17 @@ fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
         let target = fs::read_link(src).map_err(|e| io_error(&e, "readlink", src))?;
         let target =
             if target.is_absolute() { target } else { src.parent().map(|p| p.join(&target)).unwrap_or(target) };
-        if fs::symlink_metadata(dest).is_ok() {
-            fs::remove_file(dest).map_err(|e| io_error(&e, "unlink", dest))?;
-        }
         symlink(&target, dest)?;
+    } else if !ft.is_file() {
+        // A FIFO or device file: opening one could block forever, and it holds no save data.
+        return Err(cp_einval(format!("{} is not a regular file, folder or symlink", src.display()), src));
     } else {
-        fs::copy(src, dest).map_err(|e| anyhow!("{} -> '{}'", io_error(&e, "copyfile", src), dest.display()))?;
+        let copy_error = |e: std::io::Error| anyhow!("{} -> '{}'", io_error(&e, "copyfile", src), dest.display());
+        let mut from = fs::File::open(src).map_err(copy_error)?;
+        // create_new: fails on an existing entry, symlink or not, instead of writing through it.
+        let mut to = fs::OpenOptions::new().write(true).create_new(true).open(dest).map_err(copy_error)?;
+        std::io::copy(&mut from, &mut to).map_err(copy_error)?;
+        to.set_permissions(meta.permissions()).map_err(copy_error)?;
     }
     Ok(())
 }
@@ -509,60 +511,151 @@ fn symlink(target: &Path, link: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, link).map_err(|e| io_error(&e, "symlink", link))
 }
 
+/// Without symlinks, the file the link points at is copied in its place.
 #[cfg(not(unix))]
 fn symlink(target: &Path, link: &Path) -> Result<()> {
-    fs::copy(target, link).map(|_| ()).map_err(|e| io_error(&e, "symlink", link))
+    let copy = || -> std::io::Result<()> {
+        let mut from = fs::File::open(target)?;
+        let mut to = fs::OpenOptions::new().write(true).create_new(true).open(link)?;
+        std::io::copy(&mut from, &mut to).map(|_| ())
+    };
+    copy().map_err(|e| io_error(&e, "symlink", link))
 }
 
-fn backup(args: &Args) -> Result<ToolResult> {
-    let Some(destination) = args.str("destination").filter(|d| !d.is_empty()) else {
-        return Ok(ToolResult::error("destination is required for backup action."));
-    };
+/// Whether either folder is inside the other (or they are the same).
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
 
+/// Copy local cloud saves into a new, timestamped folder in the output folder.
+fn backup(args: &Args) -> Result<ToolResult> {
     let userdata = get_user_data_dir()?;
-    let dest_dir = PathBuf::from(&destination);
-    fs::create_dir_all(&dest_dir).map_err(|e| io_error(&e, "mkdir", &dest_dir))?;
+    let out_dir = output::output_dir()?;
+    // Compared resolved, so `..` and symlinks can't hide an overlap. When
+    // userdata can't be resolved, the copy below fails on it anyway.
+    if let Ok(real_userdata) = fs::canonicalize(&userdata)
+        && overlaps(&out_dir, &real_userdata)
+    {
+        return Ok(ToolResult::error(format!(
+            "The output folder {} overlaps the Steam userdata folder {}; set {} to a folder outside it.",
+            out_dir.display(),
+            real_userdata.display(),
+            output::OUTPUT_DIR_ENV
+        )));
+    }
     read_all_manifests()?;
+
+    let appid = args.f64("appid").map(js_num);
+    if let Some(id) = &appid
+        && !userdata.join(id).exists()
+    {
+        return Ok(ToolResult::error(format!("No cloud save data found for appid {id} in {}", userdata.display())));
+    }
+    let name = match &appid {
+        Some(id) => format!("saves-{}-{id}", output::timestamp()),
+        None => format!("saves-{}", output::timestamp()),
+    };
+    let dest_dir = output::create_unique_folder(&out_dir, &name)?;
 
     let mut backed_up = 0;
     let mut total = 0;
-
-    if let Some(appid) = args.f64("appid") {
-        let id = js_num(appid);
-        let src = userdata.join(&id);
-        if !src.exists() {
-            return Ok(ToolResult::error(format!("No cloud save data found for appid {id} in {}", userdata.display())));
+    let result = (|| -> Result<()> {
+        if let Some(id) = &appid {
+            let dest = dest_dir.join(id);
+            copy_recursive(&userdata.join(id), &dest)?;
+            total += dir_size(&dest);
+            backed_up = 1;
+            return Ok(());
         }
-        let dest = dest_dir.join(&id);
-        copy_recursive(&src, &dest)?;
-        total += dir_size(&dest);
-        backed_up = 1;
-    } else {
-        let result = (|| -> Result<()> {
-            for entry in fs::read_dir(&userdata).map_err(|e| io_error(&e, "scandir", &userdata))? {
-                let entry = entry.map_err(|e| io_error(&e, "scandir", &userdata))?;
-                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-                    continue;
-                }
-                let name = entry.file_name();
-                if parse_int(&name.to_string_lossy()).is_none() {
-                    continue;
-                }
-                let dest = dest_dir.join(&name);
-                copy_recursive(&entry.path(), &dest)?;
-                total += dir_size(&dest);
-                backed_up += 1;
+        for entry in fs::read_dir(&userdata).map_err(|e| io_error(&e, "scandir", &userdata))? {
+            let entry = entry.map_err(|e| io_error(&e, "scandir", &userdata))?;
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
             }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            return Ok(ToolResult::error(format!("Error reading userdata directory {}: {e}", userdata.display())));
+            let name = entry.file_name();
+            if parse_int(&name.to_string_lossy()).is_none() {
+                continue;
+            }
+            let dest = dest_dir.join(&name);
+            copy_recursive(&entry.path(), &dest)?;
+            total += dir_size(&dest);
+            backed_up += 1;
         }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        return Ok(ToolResult::error(format!(
+            "Backup from {} stopped: {e}. {} holds a partial copy.",
+            userdata.display(),
+            dest_dir.display()
+        )));
     }
 
     Ok(ToolResult::json(&json!({
         "gamesBackedUp": backed_up,
         "totalSize": format_bytes(total as f64),
-        "destination": destination,
+        "destination": dest_dir.to_string_lossy(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlap_is_containment_either_way() {
+        assert!(overlaps(Path::new("/a/b"), Path::new("/a")));
+        assert!(overlaps(Path::new("/a"), Path::new("/a/b")));
+        assert!(overlaps(Path::new("/a"), Path::new("/a")));
+        assert!(!overlaps(Path::new("/a/b"), Path::new("/a/bc")));
+    }
+
+    #[test]
+    fn copy_never_merges_or_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("remote")).unwrap();
+        fs::write(src.join("remote/save.dat"), "save").unwrap();
+
+        let dest = tmp.path().join("dest");
+        copy_recursive(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("remote/save.dat")).unwrap(), "save");
+
+        // An existing destination is refused, not merged into.
+        assert!(copy_recursive(&src, &dest).is_err());
+
+        // A file already in the way is refused, not truncated.
+        let in_the_way = tmp.path().join("other.dat");
+        fs::write(&in_the_way, "keep").unwrap();
+        assert!(copy_entry(&src.join("remote/save.dat"), &in_the_way).is_err());
+        assert_eq!(fs::read_to_string(&in_the_way).unwrap(), "keep");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_refuses_fifos_instead_of_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(copy_entry(&fifo, &tmp.path().join("copy")).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_never_writes_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("X"), "save").unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        std::os::unix::fs::symlink(&victim, dest.join("X")).unwrap();
+        assert!(copy_entry(&src.join("X"), &dest.join("X")).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+    }
 }

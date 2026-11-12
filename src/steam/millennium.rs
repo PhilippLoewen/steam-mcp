@@ -17,7 +17,9 @@ use crate::util::js_num;
 
 pub const BRIDGE_PLUGIN: &str = "steam-mcp-bridge";
 
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// Largest MEP frame accepted. Bridge answers are a few kilobytes; the cap
+/// only keeps a misbehaving peer from making us buffer without bound.
+const MAX_FRAME: usize = 4 * 1024 * 1024;
 
 pub fn mep_socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("MILLENNIUM_MEP_SOCKET").filter(|p| !p.is_empty()) {
@@ -79,10 +81,26 @@ pub struct MepClient {
 
 #[cfg(unix)]
 impl MepClient {
+    /// Connect, refusing a socket another user owns or serves: in a shared
+    /// /tmp anyone could bind the default path before Millennium does.
     pub async fn connect(socket_path: &Path, timeout: Duration) -> Result<Self> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        // SAFETY: geteuid has no preconditions and can't fail.
+        let me = unsafe { libc::geteuid() };
+        let meta = std::fs::symlink_metadata(socket_path)?;
+        if !meta.file_type().is_socket() {
+            bail!("{} is not a socket (symlinks aren't followed)", socket_path.display());
+        }
+        if meta.uid() != me {
+            bail!("{} belongs to another user (uid {}), so it isn't trusted", socket_path.display(), meta.uid());
+        }
         let stream = tokio::time::timeout(timeout, Stream::connect(socket_path))
             .await
             .map_err(|_| anyhow!("Timed out connecting to {}", socket_path.display()))??;
+        let peer = stream.peer_cred()?.uid();
+        if peer != me {
+            bail!("{} is served by another user (uid {peer}), so it isn't trusted", socket_path.display());
+        }
         Ok(Self { stream, reader: FrameReader::default(), queued: Default::default(), next_id: 0 })
     }
 
@@ -594,6 +612,21 @@ mod tests {
         assert!(config.lock().unwrap().is_empty());
         let calls = calls.lock().unwrap();
         assert_eq!(calls[calls.len() - 2..], ["plugin.config.delete", "plugin.config.delete"]);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_path_that_is_not_a_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mep.sock");
+        std::fs::write(&file, "").unwrap();
+        let err = MepClient::connect(&file, Duration::from_secs(2)).await.err().unwrap();
+        assert!(err.to_string().contains("not a socket"), "{err}");
+    }
+
+    #[test]
+    fn oversized_frames_are_refused() {
+        let mut reader = FrameReader::default();
+        assert!(reader.push(&((MAX_FRAME + 1) as u32).to_le_bytes()).is_err());
     }
 
     #[tokio::test]

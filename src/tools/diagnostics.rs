@@ -18,6 +18,9 @@ pub fn tool() -> Tool {
             Param::new("lines", ParamType::Number),
         ],
         handler: |args| boxed(async move { ToolResult::or_error(run(&args), "Error parsing log") }),
+        writes: &[],
+        destructive: false,
+        open_world: false,
     }
 }
 

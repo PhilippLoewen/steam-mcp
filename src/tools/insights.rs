@@ -2,8 +2,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::io::Write as _;
+use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use chrono::{Datelike, Local, TimeZone};
@@ -11,11 +11,12 @@ use futures::future::join_all;
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 
+use crate::output;
 use crate::steam::api::{HTTP, steam_api_request};
 use crate::steam::manifests::read_all_manifests;
 use crate::steam::paths::get_user_config;
 use crate::steam::userdata::get_all_playtimes;
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{
     format_playtime, format_timestamp, io_error, js_num, js_sort, locale_cmp, now_seconds, num, to_fixed,
 };
@@ -31,10 +32,11 @@ pub fn tool() -> Tool {
         params: vec![
             Param::new("action", ParamType::Enum(&["completion", "timeline", "year_review", "play_history", "export"]))
                 .required(),
-            Param::new("steamid", ParamType::String),
+            Param::new("steamid", ParamType::SteamId),
             Param::new("year", ParamType::Number),
             Param::new("format", ParamType::Enum(&["json", "csv"])),
-            Param::new("output", ParamType::String),
+            Param::new("output", ParamType::String)
+                .describe("Export file name inside the output folder; default steam-library-<time>"),
             Param::new("limit", ParamType::Number),
             Param::new("sort_by", ParamType::Enum(&["playtime", "last_played", "name"])),
             Param::new("installed_only", ParamType::Boolean),
@@ -43,6 +45,9 @@ pub fn tool() -> Tool {
             Param::new("include_achievements", ParamType::Boolean),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[Write::Action("export")],
+        destructive: false,
+        open_world: true,
     }
 }
 
@@ -218,35 +223,15 @@ fn month_key(unix_seconds: i64) -> String {
 }
 
 fn escape_csv_field(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') {
+    // A leading = + - @ (or tab, CR, LF) makes spreadsheets read the field as a formula.
+    if value.starts_with(['=', '+', '-', '@', '\t', '\r', '\n']) {
+        return escape_csv_field(&format!("'{value}"));
+    }
+    if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()
     }
-}
-
-/// Node's `path.resolve` of a single path.
-fn resolve_path(p: &str) -> PathBuf {
-    let joined = if Path::new(p).is_absolute() {
-        PathBuf::from(p)
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(p)
-    };
-    let mut out = PathBuf::new();
-    for comp in joined.components() {
-        match comp {
-            // Keep the root and any Windows drive or UNC prefix.
-            Component::Prefix(_) | Component::RootDir => out.push(comp.as_os_str()),
-            Component::ParentDir => {
-                if out.file_name().is_some() {
-                    out.pop();
-                }
-            }
-            Component::Normal(c) => out.push(c),
-            Component::CurDir => {}
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -649,15 +634,24 @@ async fn fetch_achievements(appid: i64, steamid: &str) -> Option<(i64, i64)> {
     Some((count_unlocked(achievements), achievements.len() as i64))
 }
 
+/// The export's file name: the one given, ending in the format's extension,
+/// or a timestamped default.
+fn export_name(given: Option<String>, format: &str) -> String {
+    match given {
+        Some(name) if Path::new(&name).extension().is_some_and(|e| e.eq_ignore_ascii_case(format)) => name,
+        Some(name) => format!("{name}.{format}"),
+        None => format!("steam-library-{}.{format}", output::timestamp()),
+    }
+}
+
 async fn export(args: &Args) -> Result<ToolResult> {
     let format = args.str("format").unwrap_or_else(|| "json".into());
-    let output_path = args.str("output").filter(|s| !s.is_empty());
     let include_playtime = args.bool("include_playtime").unwrap_or(true);
     let include_achievements = args.bool("include_achievements").unwrap_or(false);
-
-    let Some(output_path) = output_path else {
-        return Ok(ToolResult::error("Error: output is required for export action."));
-    };
+    let name = export_name(args.str("output").filter(|s| !s.is_empty()), &format);
+    let dir = output::output_dir()?;
+    // Fail on a bad or taken name before the slow API calls, not after.
+    output::check_new_name(&dir, &name)?;
 
     let steamid = get_user_config()?.steam_id64;
     let games = fetch_owned_games(&steamid).await?;
@@ -710,22 +704,22 @@ async fn export(args: &Args) -> Result<ToolResult> {
 
     js_sort(&mut rows, |a, b| b.playtime_forever - a.playtime_forever);
 
-    let resolved = resolve_path(&output_path);
-    let dir = resolved.parent().unwrap_or(Path::new("/"));
-    if !dir.exists() {
-        fs::create_dir_all(dir).map_err(|e| io_error(&e, "mkdir", dir))?;
-    }
-
     let content = if format == "json" {
         serde_json::to_string_pretty(&Value::Array(rows.iter().map(ExportRow::to_json).collect()))?
     } else {
         let header = "appid,name,playtime_forever,playtime_formatted,last_played,achievements_unlocked,achievements_total,completion_pct";
         std::iter::once(header.to_string()).chain(rows.iter().map(ExportRow::to_csv)).collect::<Vec<_>>().join("\n")
     };
-    fs::write(&resolved, content).map_err(|e| io_error(&e, "open", &resolved))?;
+    let (path, mut file) = output::create_file(&dir, &name)?;
+    if let Err(e) = file.write_all(content.as_bytes()) {
+        // Don't leave a partial file holding the name.
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(io_error(&e, "write", &path));
+    }
 
     Ok(ToolResult::json(&json!({
-        "path": resolved.to_string_lossy(),
+        "path": path.to_string_lossy(),
         "format": format,
         "game_count": rows.len(),
         "include_playtime": include_playtime,
@@ -764,15 +758,23 @@ mod tests {
     }
 
     #[test]
+    fn export_names_end_in_the_format() {
+        assert_eq!(export_name(Some("lib".into()), "json"), "lib.json");
+        assert_eq!(export_name(Some("lib.JSON".into()), "json"), "lib.JSON");
+        assert_eq!(export_name(Some("lib.csv".into()), "json"), "lib.csv.json");
+        let default = export_name(None, "csv");
+        assert!(default.starts_with("steam-library-") && default.ends_with(".csv"), "{default}");
+    }
+
+    #[test]
     fn csv_escaping() {
         assert_eq!(escape_csv_field("a,b"), "\"a,b\"");
         assert_eq!(escape_csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(escape_csv_field("plain"), "plain");
-    }
-
-    #[test]
-    fn resolves_like_node() {
-        assert_eq!(resolve_path("/a/b/../c/./d/"), PathBuf::from("/a/c/d"));
-        assert_eq!(resolve_path("/.."), PathBuf::from("/"));
+        assert_eq!(escape_csv_field("=HYPERLINK(\"x\")"), "\"'=HYPERLINK(\"\"x\"\")\"");
+        assert_eq!(escape_csv_field("-5"), "'-5");
+        assert_eq!(escape_csv_field("Safe\r=1+1"), "\"Safe\r=1+1\"");
+        assert_eq!(escape_csv_field("\r=1"), "\"'\r=1\"");
+        assert_eq!(escape_csv_field("\n=1"), "\"'\n=1\"");
     }
 }

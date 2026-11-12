@@ -23,9 +23,12 @@ pub fn tool() -> Tool {
                 .required(),
             Param::new("appid", ParamType::Number),
             Param::new("name", ParamType::String),
-            Param::new("steamid", ParamType::String),
+            Param::new("steamid", ParamType::SteamId),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[],
+        destructive: false,
+        open_world: true,
     }
 }
 

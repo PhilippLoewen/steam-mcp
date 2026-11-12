@@ -6,9 +6,15 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::steam::shortcuts::{ShortcutEntry, read_shortcuts, write_shortcuts};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::steam::launch_options::{check_launch_options, check_shortcut_exe, check_start_dir};
+use crate::steam::paths::steam_may_be_running;
+use crate::steam::shortcuts::{ShortcutEntry, add_shortcuts, read_shortcuts, remove_shortcut};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{format_timestamp, home_dir, js_num};
+
+const STEAM_RUNNING_WARNING: &str = "WARNING: Steam is currently running (or that couldn't be checked)!\n\
+     Steam keeps shortcuts in memory and rewrites shortcuts.vdf, so an edit made now would be lost.\n\
+     Please close Steam first, then try again.\n\nShortcuts were NOT modified.";
 
 pub fn tool() -> Tool {
     Tool {
@@ -26,6 +32,9 @@ pub fn tool() -> Tool {
             Param::new("game_ids", ParamType::ArrayOfNumbers).describe("Lutris game IDs to import; omit for all"),
         ],
         handler: |args| boxed(handle(args)),
+        writes: &[Write::Action("add"), Write::Action("remove"), Write::Action("import_lutris")],
+        destructive: true,
+        open_world: false,
     }
 }
 
@@ -120,24 +129,43 @@ fn list() -> Result<ToolResult> {
 
 fn add(args: &Args) -> Result<ToolResult> {
     let _guard = crate::util::file_edit_lock();
+    if steam_may_be_running() {
+        return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
+    }
     let name = args.str("name").filter(|s| !s.is_empty());
     let exe = args.str("exe").filter(|s| !s.is_empty());
     let (Some(name), Some(exe)) = (name, exe) else {
         return Ok(ToolResult::error("Error: \"name\" and \"exe\" are required for the add action."));
     };
+    let launch_options = args.str("launch_options").unwrap_or_default();
+    // Save the checked paths, not links that could be repointed later.
+    let checked = check_shortcut_exe(&exe).and_then(|exe| {
+        let start_dir = check_start_dir(&args.str("start_dir").unwrap_or_else(|| dirname(&exe)))?;
+        check_launch_options(&launch_options)?;
+        Ok((exe, start_dir))
+    });
+    let (exe, start_dir) = match checked {
+        Ok(checked) => checked,
+        Err(why) => {
+            return Ok(ToolResult::error(format!(
+                "Shortcut NOT added: {why}. For anything else, add the shortcut in Steam yourself."
+            )));
+        }
+    };
 
-    let mut shortcuts = read_shortcuts()?;
+    // Quoted, as Steam writes these fields itself: Steam puts them into the
+    // command line it may run through a shell, and the checks above leave
+    // nothing a shell would interpret inside double quotes.
     let entry = ShortcutEntry {
         appid: generate_shortcut_id(&exe, &name),
-        start_dir: args.str("start_dir").unwrap_or_else(|| dirname(&exe)),
+        start_dir: format!("\"{start_dir}\""),
         app_name: name,
-        exe,
-        launch_options: args.str("launch_options").unwrap_or_default(),
+        exe: format!("\"{exe}\""),
+        launch_options,
         last_play_time: 0,
         tags: args.strings("tags").unwrap_or_default(),
     };
-    shortcuts.push(entry.clone());
-    write_shortcuts(&shortcuts)?;
+    add_shortcuts(std::slice::from_ref(&entry))?;
 
     Ok(ToolResult::json(&json!({
         "message": "Shortcut added successfully",
@@ -147,27 +175,26 @@ fn add(args: &Args) -> Result<ToolResult> {
 
 fn remove(args: &Args) -> Result<ToolResult> {
     let _guard = crate::util::file_edit_lock();
+    if steam_may_be_running() {
+        return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
+    }
     let appid = args.f64("appid");
     let name = args.str("name");
     if appid.is_none() && name.is_none() {
         return Ok(ToolResult::error("Error: Either appid or name must be provided."));
     }
 
-    let mut shortcuts = read_shortcuts()?;
-    let index = shortcuts.iter().position(|s| match appid {
+    let removed = remove_shortcut(|s| match appid {
         Some(id) => s.appid as f64 == id,
         None => Some(&s.app_name) == name.as_ref(),
-    });
-    let Some(index) = index else {
+    })?;
+    let Some(removed) = removed else {
         let target = match appid {
             Some(id) => format!("appid {}", js_num(id)),
             None => format!("name \"{}\"", name.unwrap_or_default()),
         };
         return Ok(ToolResult::error(format!("Shortcut not found matching {target}.")));
     };
-
-    let removed = shortcuts.remove(index);
-    write_shortcuts(&shortcuts)?;
 
     Ok(ToolResult::json(&json!({
         "message": "Shortcut removed successfully",
@@ -188,17 +215,6 @@ async fn exec(command: &str, timeout: Duration) -> Option<String> {
         .ok()?;
     let output = tokio::time::timeout(timeout, child.wait_with_output()).await.ok()?.ok()?;
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// A value as JS `${value}` prints it.
-fn js_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.as_f64().map(js_num).unwrap_or_else(|| n.to_string()),
-        Value::Null => "null".into(),
-        Value::Bool(b) => b.to_string(),
-        Value::Array(_) | Value::Object(_) => v.to_string(),
-    }
 }
 
 async fn import_lutris(args: &Args) -> Result<ToolResult> {
@@ -227,22 +243,30 @@ async fn import_lutris(args: &Args) -> Result<ToolResult> {
     }
 
     let _guard = crate::util::file_edit_lock();
-    let mut shortcuts = read_shortcuts()?;
-    let existing_names: HashSet<String> = shortcuts.iter().map(|s| s.app_name.to_lowercase()).collect();
+    if steam_may_be_running() {
+        return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
+    }
+    let existing_names: HashSet<String> = read_shortcuts()?.iter().map(|s| s.app_name.to_lowercase()).collect();
+    let mut new_shortcuts = Vec::new();
     let mut imported: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
 
     for game in &lutris_games {
         let name = game
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("Cannot read properties of undefined (reading 'toLowerCase')"))?;
+        // The id goes into launch options, so only a plain number is used.
+        let Some(id) = game.get("id").and_then(Value::as_u64) else {
+            invalid.push(name.to_string());
+            continue;
+        };
         if existing_names.contains(&name.to_lowercase()) {
             skipped.push(name.to_string());
             continue;
         }
-        let id = game.get("id").map_or_else(|| "undefined".to_string(), js_string);
-        shortcuts.push(ShortcutEntry {
+        new_shortcuts.push(ShortcutEntry {
             appid: generate_shortcut_id("lutris", name),
             app_name: name.to_string(),
             exe: "lutris".into(),
@@ -254,19 +278,20 @@ async fn import_lutris(args: &Args) -> Result<ToolResult> {
         imported.push(name.to_string());
     }
 
-    if !imported.is_empty() {
-        write_shortcuts(&shortcuts)?;
+    if !new_shortcuts.is_empty() {
+        add_shortcuts(&new_shortcuts)?;
     }
 
-    Ok(ToolResult::json(&json!({
-        "message": format!(
-            "Imported {} game(s), skipped {} already-existing shortcut(s).",
-            imported.len(),
-            skipped.len()
-        ),
-        "imported": imported,
-        "skipped": skipped,
-    })))
+    let mut message =
+        format!("Imported {} game(s), skipped {} already-existing shortcut(s).", imported.len(), skipped.len());
+    if !invalid.is_empty() {
+        message.push_str(&format!(" {} game(s) had no numeric Lutris id and were left out.", invalid.len()));
+    }
+    let mut out = json!({ "message": message, "imported": imported, "skipped": skipped });
+    if !invalid.is_empty() {
+        out["invalidId"] = json!(invalid);
+    }
+    Ok(ToolResult::json(&out))
 }
 
 #[cfg(test)]
