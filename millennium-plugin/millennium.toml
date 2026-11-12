@@ -1,0 +1,18 @@
+[plugin]
+# The id is the name steam-mcp uses on Millennium's socket; keep it in sync with BRIDGE_PLUGIN.
+id = "steam-mcp-bridge"
+name = "Steam MCP Bridge"
+version = "1.0.0"
+author = "Praeses0"
+description = "Lets steam-mcp edit library categories while Steam is running."
+
+[backend]
+entry = "backend/main.lua"
+sources = ["backend/**/*.lua"]
+
+[frontend]
+entry = "frontend/index.tsx"
+
+[compiler]
+# auto = install into the detected Millennium plugins folder
+output_path = "auto"
