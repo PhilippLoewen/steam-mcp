@@ -3,6 +3,7 @@
 //! STEAM_TOOLS=core,compat,... limits the registered tool categories;
 //! unset, all are registered.
 
+mod output;
 mod server;
 mod steam;
 mod tool;
