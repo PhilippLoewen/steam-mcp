@@ -80,7 +80,7 @@ Add a `.mcp.json` in your project root, or add to `~/.claude.json` for system-wi
 }
 ```
 
-> **Note:** The `STEAM_API_KEY` is optional. Most tools work without it. Only a few actions (achievements, friends, owned games, wishlist, profile) require it. Get your key at [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey).
+> **Note:** The `STEAM_API_KEY` is optional. Most tools work without it. Only a few actions (achievements, friends, owned games, profile) require it. The wishlist needs no key, but it must be public. Get your key at [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey).
 
 ### Category filtering
 
@@ -372,7 +372,7 @@ src/
 │   ├── categories.rs        # Library categories (cloud-storage-namespace-1.json) read/write
 │   ├── millennium.rs        # Live category edits via the Millennium bridge plugin
 │   ├── api.rs               # Steam Web API / Store API client
-│   └── wishlist.rs          # Wishlist data fetching
+│   └── wishlist.rs          # Wishlist, store details and prices
 └── tools/                   # 14 consolidated MCP tools (one file per tool)
 millennium-plugin/           # steam-mcp-bridge: Millennium plugin for live category edits
 ```

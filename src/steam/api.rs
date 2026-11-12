@@ -72,6 +72,19 @@ pub async fn steam_api_request(iface: &str, method: &str, version: &str, params:
     Ok(resp.json().await.map_err(reqwest::Error::without_url)?)
 }
 
+/// GET a Web API method that needs no key (IWishlistService, IStoreBrowseService).
+pub async fn public_api_request(iface: &str, method: &str, version: &str, params: &[(&str, String)]) -> Result<Value> {
+    let mut url = reqwest::Url::parse(&format!("{STEAM_API_BASE}/{iface}/{method}/{version}/"))?;
+    url.query_pairs_mut().extend_pairs(params.iter().map(|(k, v)| (*k, v.as_str())));
+    let resp = HTTP.get(url).send().await.map_err(reqwest::Error::without_url)?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("Steam API {}: {}", status.as_u16(), snippet(&body));
+    }
+    Ok(resp.json().await.map_err(reqwest::Error::without_url)?)
+}
+
 /// GET {STORE_API_BASE}{path} with `params`; no key needed.
 pub async fn store_api_request(path: &str, params: &[(&str, String)]) -> Result<Value> {
     let mut url = reqwest::Url::parse(&format!("{STORE_API_BASE}{path}"))?;
