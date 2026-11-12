@@ -44,6 +44,8 @@ pub enum ParamType {
     ArrayOfStrings,
     ArrayOfNumbers,
     ArrayOfIntegers,
+    /// A SteamID64: exactly 17 digits. It goes into Web API URLs, so nothing else is accepted.
+    SteamId,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +90,7 @@ impl Param {
             ParamType::ArrayOfStrings => json!({ "type": "array", "items": { "type": "string" } }),
             ParamType::ArrayOfNumbers => json!({ "type": "array", "items": { "type": "number" } }),
             ParamType::ArrayOfIntegers => json!({ "type": "array", "items": { "type": "integer" } }),
+            ParamType::SteamId => json!({ "type": "string", "pattern": "^[0-9]{17}$" }),
         };
         let obj = s.as_object_mut().expect("object");
         if let Some(d) = &self.default {
@@ -119,6 +122,9 @@ impl Param {
             ParamType::ArrayOfStrings => value.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
             ParamType::ArrayOfNumbers => value.as_array().is_some_and(|a| a.iter().all(Value::is_number)),
             ParamType::ArrayOfIntegers => value.as_array().is_some_and(|a| a.iter().all(is_int)),
+            ParamType::SteamId => {
+                value.as_str().is_some_and(|s| s.len() == 17 && s.bytes().all(|b| b.is_ascii_digit()))
+            }
         };
         if ok {
             Ok(())
@@ -135,6 +141,7 @@ impl Param {
             ParamType::ArrayOfStrings => "array of strings",
             ParamType::ArrayOfNumbers => "array of numbers",
             ParamType::ArrayOfIntegers => "array of integers",
+            ParamType::SteamId => "a SteamID64 (17 digits)",
         }
     }
 }

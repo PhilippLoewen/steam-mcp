@@ -32,7 +32,7 @@ pub fn tool() -> Tool {
         params: vec![
             Param::new("action", ParamType::Enum(&["completion", "timeline", "year_review", "play_history", "export"]))
                 .required(),
-            Param::new("steamid", ParamType::String),
+            Param::new("steamid", ParamType::SteamId),
             Param::new("year", ParamType::Number),
             Param::new("format", ParamType::Enum(&["json", "csv"])),
             Param::new("output", ParamType::String)

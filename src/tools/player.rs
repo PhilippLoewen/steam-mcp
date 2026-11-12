@@ -25,7 +25,7 @@ pub fn tool() -> Tool {
         description: "Profile, level, bans, friends, achievements, owned/recent games",
         params: vec![
             Param::new("action", ParamType::Enum(ACTIONS)).required(),
-            Param::new("steamid", ParamType::String),
+            Param::new("steamid", ParamType::SteamId),
             Param::new("appid", ParamType::Number),
         ],
         handler: |args| boxed(handle(args)),

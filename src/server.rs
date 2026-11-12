@@ -165,6 +165,20 @@ mod tests {
     }
 
     #[test]
+    fn steamids_must_be_17_digits() {
+        let server = SteamServer { tools: Arc::new(crate::tools::enabled(None)), read_only: false };
+        for (tool, action) in [("player", "summary"), ("insights", "export"), ("deals", "wishlist")] {
+            for bad in ["../../x", "7656119796026572?x=1", "7656119796026572", "765611979602657280", ""] {
+                let args = serde_json::json!({ "action": action, "steamid": bad });
+                let request =
+                    CallToolRequestParams::new(tool.to_string()).with_arguments(args.as_object().unwrap().clone());
+                let result = futures::executor::block_on(server.call(request));
+                assert!(result.is_error && result.text.contains("SteamID64"), "{tool} {bad:?}: {}", result.text);
+            }
+        }
+    }
+
+    #[test]
     fn write_tools_are_annotated() {
         let server = SteamServer { tools: Arc::new(crate::tools::enabled(None)), read_only: false };
         let hints = |name: &str| {

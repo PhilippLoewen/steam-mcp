@@ -278,7 +278,9 @@ fn cleanup() -> Result<ToolResult> {
 
     Ok(ToolResult::json(&json!({
         "orphanedData": {
-            "description": "Data directories for uninstalled games. Safe to delete.",
+            "description": "Data directories for uninstalled games. Shader caches (shadercache) can be deleted safely. \
+                Proton prefixes (compatdata) can hold the only copy of saves and settings for games without \
+                Steam Cloud: back them up or check them before deleting.",
             "count": orphans.len(),
             "totalSize": fmt(orphans.iter().map(|o| o.size).sum()),
             "items": orphans.iter().take(20).map(Orphan::to_json).collect::<Vec<_>>(),
