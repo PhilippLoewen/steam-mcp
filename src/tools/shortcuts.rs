@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::steam::shortcuts::{ShortcutEntry, read_shortcuts, write_shortcuts};
+use crate::steam::shortcuts::{ShortcutEntry, add_shortcuts, read_shortcuts, remove_shortcut};
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
 use crate::util::{format_timestamp, home_dir, js_num};
 
@@ -126,7 +126,6 @@ fn add(args: &Args) -> Result<ToolResult> {
         return Ok(ToolResult::error("Error: \"name\" and \"exe\" are required for the add action."));
     };
 
-    let mut shortcuts = read_shortcuts()?;
     let entry = ShortcutEntry {
         appid: generate_shortcut_id(&exe, &name),
         start_dir: args.str("start_dir").unwrap_or_else(|| dirname(&exe)),
@@ -136,8 +135,7 @@ fn add(args: &Args) -> Result<ToolResult> {
         last_play_time: 0,
         tags: args.strings("tags").unwrap_or_default(),
     };
-    shortcuts.push(entry.clone());
-    write_shortcuts(&shortcuts)?;
+    add_shortcuts(std::slice::from_ref(&entry))?;
 
     Ok(ToolResult::json(&json!({
         "message": "Shortcut added successfully",
@@ -153,21 +151,17 @@ fn remove(args: &Args) -> Result<ToolResult> {
         return Ok(ToolResult::error("Error: Either appid or name must be provided."));
     }
 
-    let mut shortcuts = read_shortcuts()?;
-    let index = shortcuts.iter().position(|s| match appid {
+    let removed = remove_shortcut(|s| match appid {
         Some(id) => s.appid as f64 == id,
         None => Some(&s.app_name) == name.as_ref(),
-    });
-    let Some(index) = index else {
+    })?;
+    let Some(removed) = removed else {
         let target = match appid {
             Some(id) => format!("appid {}", js_num(id)),
             None => format!("name \"{}\"", name.unwrap_or_default()),
         };
         return Ok(ToolResult::error(format!("Shortcut not found matching {target}.")));
     };
-
-    let removed = shortcuts.remove(index);
-    write_shortcuts(&shortcuts)?;
 
     Ok(ToolResult::json(&json!({
         "message": "Shortcut removed successfully",
@@ -227,8 +221,8 @@ async fn import_lutris(args: &Args) -> Result<ToolResult> {
     }
 
     let _guard = crate::util::file_edit_lock();
-    let mut shortcuts = read_shortcuts()?;
-    let existing_names: HashSet<String> = shortcuts.iter().map(|s| s.app_name.to_lowercase()).collect();
+    let existing_names: HashSet<String> = read_shortcuts()?.iter().map(|s| s.app_name.to_lowercase()).collect();
+    let mut new_shortcuts = Vec::new();
     let mut imported: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
@@ -242,7 +236,7 @@ async fn import_lutris(args: &Args) -> Result<ToolResult> {
             continue;
         }
         let id = game.get("id").map_or_else(|| "undefined".to_string(), js_string);
-        shortcuts.push(ShortcutEntry {
+        new_shortcuts.push(ShortcutEntry {
             appid: generate_shortcut_id("lutris", name),
             app_name: name.to_string(),
             exe: "lutris".into(),
@@ -254,8 +248,8 @@ async fn import_lutris(args: &Args) -> Result<ToolResult> {
         imported.push(name.to_string());
     }
 
-    if !imported.is_empty() {
-        write_shortcuts(&shortcuts)?;
+    if !new_shortcuts.is_empty() {
+        add_shortcuts(&new_shortcuts)?;
     }
 
     Ok(ToolResult::json(&json!({

@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use crate::steam::paths::is_steam_running;
 use crate::steam::userdata::{get_app_launch_options, get_local_config, set_app_launch_options};
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
-use crate::util::{home_dir, io_error, js_num, num, read_text};
+use crate::util::{backup_file, home_dir, io_error, js_num, num, read_text, write_atomic};
 use crate::vdf::{VdfObject, VdfValue, is_array_index, js_entries};
 
 const ACTIONS: &[&str] = &["get_launch_opts", "set_launch_opts", "presets", "mangohud", "steam_settings"];
@@ -366,8 +366,9 @@ fn mangohud(args: &Args) -> Result<ToolResult> {
             }
 
             fs::create_dir_all(&mango_dir).map_err(|e| io_error(&e, "mkdir", &mango_dir))?;
+            backup_file(&config_path).map_err(|e| io_error(&e, "backup", &config_path))?;
             let content = lines.join("\n");
-            fs::write(&config_path, &content).map_err(|e| io_error(&e, "open", &config_path))?;
+            write_atomic(&config_path, content.as_bytes()).map_err(|e| io_error(&e, "open", &config_path))?;
 
             Ok(ToolResult::json(&json!({
                 "action": "set",
@@ -379,7 +380,8 @@ fn mangohud(args: &Args) -> Result<ToolResult> {
         }
         _ => {
             fs::create_dir_all(&mango_dir).map_err(|e| io_error(&e, "mkdir", &mango_dir))?;
-            fs::write(&config_path, format!("{MANGOHUD_DEFAULTS}\n"))
+            backup_file(&config_path).map_err(|e| io_error(&e, "backup", &config_path))?;
+            write_atomic(&config_path, format!("{MANGOHUD_DEFAULTS}\n").as_bytes())
                 .map_err(|e| io_error(&e, "open", &config_path))?;
             Ok(ToolResult::json(&json!({
                 "action": "reset",

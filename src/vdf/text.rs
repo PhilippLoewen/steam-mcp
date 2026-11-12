@@ -3,7 +3,9 @@
 //! Handles quoted strings with backslash escapes, unquoted tokens, nested
 //! objects, duplicate keys (last value wins, like Steam) and `//` comments.
 
-use super::{VdfObject, VdfValue};
+use anyhow::{Result, bail};
+
+use super::{MAX_DEPTH, VdfObject, VdfValue};
 
 #[derive(Debug, PartialEq)]
 enum Token {
@@ -16,6 +18,9 @@ enum Token {
 struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
+    /// The first thing that shows the input isn't complete, well-formed VDF.
+    /// The lenient parser carries on past it; the strict one fails on it.
+    problem: Option<String>,
 }
 
 impl<'a> Lexer<'a> {
@@ -61,7 +66,14 @@ impl<'a> Lexer<'a> {
             out.push(ch);
             self.pos += 1;
         }
+        self.flag("unterminated quoted string at end of input");
         bytes_to_string(out)
+    }
+
+    fn flag(&mut self, problem: &str) {
+        if self.problem.is_none() {
+            self.problem = Some(format!("{problem} (byte {})", self.pos));
+        }
     }
 
     fn read_unquoted(&mut self) -> String {
@@ -106,7 +118,7 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-fn parse_object(lex: &mut Lexer) -> VdfObject {
+fn parse_object(lex: &mut Lexer, depth: usize) -> VdfObject {
     let mut obj = VdfObject::new();
     loop {
         match lex.peek() {
@@ -114,30 +126,63 @@ fn parse_object(lex: &mut Lexer) -> VdfObject {
             _ => {}
         }
         let Token::Str(key) = lex.next() else {
+            lex.flag("unexpected '{'");
             continue;
         };
         match lex.peek() {
+            Token::Open if depth >= MAX_DEPTH => {
+                // Stop here rather than recurse without bound on hostile input.
+                lex.flag(&format!("nested deeper than {MAX_DEPTH} levels"));
+                lex.pos = lex.src.len();
+                break;
+            }
             Token::Open => {
                 lex.next();
-                let child = parse_object(lex);
-                obj.insert(key, VdfValue::Obj(child));
+                let child = parse_object(lex, depth + 1);
+                if obj.insert(key, VdfValue::Obj(child)).is_some() {
+                    lex.flag("duplicate key");
+                }
                 // Closing brace; a missing one is tolerated.
-                lex.next();
+                if lex.next() != Token::Close {
+                    lex.flag("missing '}' at end of input");
+                }
             }
             Token::Str(value) => {
                 lex.next();
-                obj.insert(key, VdfValue::Str(value));
+                if obj.insert(key, VdfValue::Str(value)).is_some() {
+                    lex.flag("duplicate key");
+                }
             }
-            _ => break,
+            _ => {
+                lex.flag("key without a value");
+                break;
+            }
         }
     }
     obj
 }
 
-/// Parse VDF text into an object.
+fn parse(text: &str) -> (VdfObject, Option<String>) {
+    let mut lex = Lexer { src: text.as_bytes(), pos: 0, problem: None };
+    let obj = parse_object(&mut lex, 0);
+    if lex.next() != Token::Eof {
+        lex.flag("unexpected '}'");
+    }
+    (obj, lex.problem)
+}
+
+/// Parse VDF text into an object, keeping whatever it can of malformed input.
 pub fn parse_vdf(text: &str) -> VdfObject {
-    let mut lex = Lexer { src: text.as_bytes(), pos: 0 };
-    parse_object(&mut lex)
+    parse(text).0
+}
+
+/// Parse VDF text, failing unless all of it is well-formed. Use this before
+/// writing a file back, so a truncated read can't become a truncated file.
+pub fn parse_vdf_strict(text: &str) -> Result<VdfObject> {
+    match parse(text) {
+        (obj, None) => Ok(obj),
+        (_, Some(problem)) => bail!("malformed VDF: {problem}"),
+    }
 }
 
 fn escape(s: &str) -> String {

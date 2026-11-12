@@ -16,6 +16,7 @@ use rand::Rng;
 use serde_json::{Map, Value, json};
 
 use super::paths::{get_steam_dir, get_user_config, is_steam_running};
+use crate::util::write_atomic;
 
 pub const KEY_PREFIX: &str = "user-collections.";
 
@@ -464,16 +465,6 @@ pub fn delete_category(raw: &str, query: &str, now: i64) -> Result<CategoryEdit>
     Ok(CategoryEdit::plain(stringify(&pairs), category.key, true))
 }
 
-fn write_atomic(file: &Path, content: &str) -> Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp-{}", file.display(), std::process::id()));
-    let result = fs::write(&tmp, content).and_then(|()| fs::rename(&tmp, file));
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(err.into());
-    }
-    Ok(())
-}
-
 /// Write new namespace text: back the old file up to .bak, replace it
 /// atomically and list `key` in the .modified.json sibling so Steam uploads it.
 pub fn write_categories_file(file: &Path, raw: &str, key: &str) -> Result<()> {
@@ -497,12 +488,12 @@ pub fn write_categories_file(file: &Path, raw: &str, key: &str) -> Result<()> {
     // be replaced by the cloud copy.
     if !keys.iter().any(|k| k.as_str() == Some(key)) {
         keys.push(key.into());
-        write_atomic(&modified_path, &Value::Array(keys).to_string())?;
+        write_atomic(&modified_path, Value::Array(keys).to_string().as_bytes())?;
     }
     let mut bak = file.as_os_str().to_owned();
     bak.push(".bak");
     fs::copy(file, PathBuf::from(bak))?;
-    write_atomic(file, raw)
+    Ok(write_atomic(file, raw.as_bytes())?)
 }
 
 /// The refusal for file edits under a running Steam. `bridge_status` says why

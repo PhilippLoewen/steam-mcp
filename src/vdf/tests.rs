@@ -86,17 +86,35 @@ fn buf(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
 }
 
+fn bin(entries: &[(&str, BinValue)]) -> BinObject {
+    entries.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+}
+
+fn bs(v: &str) -> BinValue {
+    BinValue::Str(v.to_string())
+}
+
+fn bo(entries: &[(&str, BinValue)]) -> BinValue {
+    BinValue::Obj(bin(entries))
+}
+
 #[test]
 fn parses_binary_values() {
-    assert_eq!(parse_binary_vdf(&[]).unwrap(), VdfObject::new());
-    assert_eq!(parse_binary_vdf(&buf(&[&[1], b"name\0Test Game\0", &[8]])).unwrap(), obj(&[("name", s("Test Game"))]));
+    assert_eq!(parse_binary_vdf(&[]).unwrap(), BinObject::new());
+    assert_eq!(parse_binary_vdf(&buf(&[&[1], b"name\0Test Game\0", &[8]])).unwrap(), bin(&[("name", bs("Test Game"))]));
     let n = 365_360u32.to_le_bytes();
-    assert_eq!(parse_binary_vdf(&buf(&[&[2], b"appid\0", &n, &[8]])).unwrap(), obj(&[("appid", s("365360"))]));
+    assert_eq!(
+        parse_binary_vdf(&buf(&[&[2], b"appid\0", &n, &[8]])).unwrap(),
+        bin(&[("appid", BinValue::Uint(365_360))])
+    );
     let max = u32::MAX.to_le_bytes();
-    assert_eq!(parse_binary_vdf(&buf(&[&[2], b"max\0", &max, &[8]])).unwrap(), obj(&[("max", s("4294967295"))]));
+    assert_eq!(
+        parse_binary_vdf(&buf(&[&[2], b"max\0", &max, &[8]])).unwrap(),
+        bin(&[("max", BinValue::Uint(u32::MAX))])
+    );
     assert_eq!(
         parse_binary_vdf(&buf(&[&[1], b"key\0first\0", &[1], b"key\0second\0", &[8]])).unwrap(),
-        obj(&[("key", s("second"))])
+        bin(&[("key", bs("second"))])
     );
 }
 
@@ -106,9 +124,9 @@ fn parses_nested_binary_objects() {
     let data =
         buf(&[&[0], b"shortcuts\0", &[0], b"0\0", &[1], b"AppName\0Heroic Game\0", &[2], b"appid\0", &a, &[8, 8, 8]]);
     let parsed = parse_binary_vdf(&data).unwrap();
-    let entry = parsed.navigate(&["shortcuts", "0"]).unwrap();
-    assert_eq!(entry.str_of(&["AppName"]), Some("Heroic Game"));
-    assert_eq!(entry.str_of(&["appid"]), Some("2000000000"));
+    let entry = parsed["shortcuts"].as_obj().unwrap()["0"].as_obj().unwrap();
+    assert_eq!(entry["AppName"].text().as_deref(), Some("Heroic Game"));
+    assert_eq!(entry["appid"].text().as_deref(), Some("2000000000"));
 }
 
 #[test]
@@ -118,17 +136,74 @@ fn rejects_unknown_binary_types() {
 }
 
 #[test]
-fn binary_round_trips() {
-    let tags = o(&[("0", s("Favorite")), ("1", s("RPG"))]);
-    let doc = obj(&[(
+fn rejects_truncated_binary_input() {
+    // A nested object without its end tag.
+    assert!(parse_binary_vdf(&buf(&[&[0], b"shortcuts\0", &[1], b"a\0b\0"])).is_err());
+    // A string without its terminator.
+    assert!(parse_binary_vdf(&buf(&[&[1], b"a\0unterminated"])).is_err());
+    // A key without its terminator.
+    assert!(parse_binary_vdf(&buf(&[&[1], b"key"])).is_err());
+}
+
+#[test]
+fn binary_round_trips_with_types() {
+    let tags = bo(&[("0", bs("Favorite")), ("1", bs("2048"))]);
+    let doc = bin(&[(
         "shortcuts",
-        o(&[("0", o(&[("appid", s("3000000000")), ("AppName", s("Game")), ("LaunchOptions", s("")), ("tags", tags)]))]),
+        bo(&[(
+            "0",
+            bo(&[
+                ("appid", BinValue::Uint(3_000_000_000)),
+                ("AppName", bs("007")),
+                ("LaunchOptions", bs("")),
+                ("tags", tags),
+            ]),
+        )]),
     )]);
-    let bytes = serialize_binary_vdf(&doc);
+    let bytes = serialize_binary_vdf(&doc).unwrap();
     assert_eq!(bytes.last(), Some(&8));
     assert_eq!(parse_binary_vdf(&bytes).unwrap(), doc);
-    // "3000000000" fits a u32 and is written as one.
     assert!(bytes.windows(7).any(|w| w == b"\x02appid\0"));
+    // Digit strings stay strings.
+    assert!(bytes.windows(13).any(|w| w == b"\x01AppName\x00007\x00"));
+}
+
+#[test]
+fn binary_serializer_refuses_nul() {
+    assert!(serialize_binary_vdf(&bin(&[("name", bs("a\0b"))])).is_err());
+    assert!(serialize_binary_vdf(&bin(&[("na\0me", bs("ab"))])).is_err());
+}
+
+#[test]
+fn deep_nesting_is_refused_without_overflowing() {
+    let depth = 100_000;
+    let mut data = Vec::new();
+    for _ in 0..depth {
+        data.extend_from_slice(b"\x00k\x00");
+    }
+    data.extend(std::iter::repeat_n(8u8, depth + 1));
+    assert!(parse_binary_vdf(&data).unwrap_err().to_string().contains("nested deeper"));
+
+    let text = "\"k\" {".repeat(depth) + &"}".repeat(depth);
+    assert!(parse_vdf_strict(&text).unwrap_err().to_string().contains("nested deeper"));
+    // The lenient parser stops at the limit instead of crashing.
+    let _ = parse_vdf(&text);
+}
+
+#[test]
+fn strict_parse_accepts_only_complete_input() {
+    let good = "\"a\"\n{\n\t\"b\"\t\t\"c\"\n}\n";
+    assert_eq!(parse_vdf_strict(good).unwrap(), parse_vdf(good));
+    for bad in [
+        "\"a\"\n{\n\t\"b\"\t\t\"c\"\n",
+        "\"a\" \"unterminated",
+        "\"a\" {}\n}",
+        "\"a\"",
+        "{ \"a\" \"b\" }",
+        "\"a\" \"1\"\n\"a\" \"2\"",
+    ] {
+        assert!(parse_vdf_strict(bad).is_err(), "{bad:?}");
+    }
 }
 
 #[test]
