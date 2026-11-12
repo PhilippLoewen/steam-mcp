@@ -1,10 +1,10 @@
 import { definePlugin, Field, pluginConfig } from 'millennium';
-import { handle, type Request } from './collections';
+import { handle, parseRequest } from './collections';
 
 async function respond(id: string, request: string): Promise<void> {
 	let response;
 	try {
-		response = { ok: true, result: await handle(JSON.parse(request) as Request) };
+		response = { ok: true, result: await handle(parseRequest(request)) };
 	} catch (error) {
 		response = { ok: false, error: error instanceof Error ? error.message : String(error) };
 	}
