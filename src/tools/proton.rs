@@ -122,9 +122,41 @@ fn js_slice_start(len: usize, start: f64) -> usize {
     if start < 0.0 { (len as f64 + start).max(0.0) as usize } else { start.min(len as f64) as usize }
 }
 
+/// How much of the end of a log `crash_logs` reads: enough for the lines it
+/// shows, without loading a log of many megabytes whole.
+const LOG_TAIL_BYTES: u64 = 256 * 1024;
+/// How much of the end of a Steam log is searched for the appid.
+const STEAM_LOG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The last `max` bytes of `path` as text, starting at a line boundary when
+/// the file is longer.
+fn read_end(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(max).read_to_end(&mut bytes)?;
+    if start > 0 {
+        // Drop the partial first line.
+        let cut = bytes.iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| i + 1);
+        bytes.drain(..cut);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether `line` mentions `appid` as a whole number, not inside a longer one.
+fn mentions_appid(line: &str, appid: &str) -> bool {
+    line.match_indices(appid).any(|(i, _)| {
+        let before = line[..i].chars().next_back();
+        let after = line[i + appid.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
 fn read_tail(path: &Path, n: f64) -> String {
-    let Ok(bytes) = fs::read(path) else { return "(unable to read file)".to_string() };
-    let content = String::from_utf8_lossy(&bytes);
+    let Ok(content) = read_end(path, LOG_TAIL_BYTES) else { return "(unable to read file)".to_string() };
     let lines: Vec<&str> = content.split('\n').collect();
     let start = (lines.len() as f64 - n).max(0.0);
     lines[js_slice_start(lines.len(), start)..].join("\n")
@@ -501,14 +533,13 @@ fn crash_logs(appid: &AppId, lines: f64) -> Result<ToolResult> {
                     continue;
                 }
                 let path = entry.path();
-                let Ok(bytes) = fs::read(&path) else { continue };
-                let content = String::from_utf8_lossy(&bytes);
-                if !content.contains(&appid.text) {
+                let Ok(content) = read_end(&path, STEAM_LOG_TAIL_BYTES) else { continue };
+                let matching: Vec<&str> = content.split('\n').filter(|l| mentions_appid(l, &appid.text)).collect();
+                if matching.is_empty() {
                     continue;
                 }
                 let Some(size) = file_size(&path) else { continue };
                 push_crash(&mut crash_files, &path, size, "steam_log");
-                let matching: Vec<&str> = content.split('\n').filter(|l| l.contains(&appid.text)).collect();
                 let relevant = matching[js_slice_start(matching.len(), -lines)..].join("\n");
                 if !relevant.is_empty() {
                     log_contents.push(log_entry(&path, relevant));
@@ -528,6 +559,27 @@ fn crash_logs(appid: &AppId, lines: f64) -> Result<ToolResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_whole_appids_only() {
+        assert!(mentions_appid("AppID 730 launched", "730"));
+        assert!(mentions_appid("[730]", "730"));
+        assert!(mentions_appid("730", "730"));
+        assert!(!mentions_appid("AppID 7300 launched", "730"));
+        assert!(!mentions_appid("17301", "730"));
+        assert!(mentions_appid("17301 and 730", "730"));
+    }
+
+    #[test]
+    fn reads_only_the_end_of_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.log");
+        let text: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        fs::write(&path, &text).unwrap();
+        let end = read_end(&path, 100).unwrap();
+        assert!(end.len() <= 100 && end.starts_with("line ") && end.ends_with("line 999\n"), "{end:?}");
+        assert_eq!(read_end(&path, 1 << 20).unwrap(), text);
+    }
 
     #[test]
     fn slices_like_js() {

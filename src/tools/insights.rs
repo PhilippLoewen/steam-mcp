@@ -11,6 +11,7 @@ use futures::future::join_all;
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 
+use super::js::truthy;
 use crate::output;
 use crate::steam::api::{HTTP, steam_api_request};
 use crate::steam::manifests::read_all_manifests;
@@ -83,16 +84,6 @@ struct Completion {
 /// JS `Math.round`.
 fn js_round(x: f64) -> f64 {
     (x + 0.5).floor()
-}
-
-fn truthy(v: Option<&Value>) -> bool {
-    match v {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(_) => true,
-    }
 }
 
 /// The end index of `arr.slice(0, limit)` for an array of `len` items.

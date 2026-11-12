@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 use serde_json::{Map, Value, json};
 
+use super::js::js_str;
 use crate::steam::api::steam_api_request;
 use crate::steam::manifests::read_all_manifests;
 use crate::steam::paths::get_library_folders;
@@ -204,21 +205,6 @@ fn truthy(v: &Value) -> bool {
         Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
         Value::String(s) => !s.is_empty(),
         _ => true,
-    }
-}
-
-/// A value as a JS template string renders it.
-fn js_str(v: Option<&Value>) -> String {
-    match v {
-        None => "undefined".into(),
-        Some(Value::Null) => "null".into(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Number(n)) => js_num(n.as_f64().unwrap_or(f64::NAN)),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => {
-            a.iter().map(|e| if e.is_null() { String::new() } else { js_str(Some(e)) }).collect::<Vec<_>>().join(",")
-        }
-        Some(Value::Object(_)) => "[object Object]".into(),
     }
 }
 

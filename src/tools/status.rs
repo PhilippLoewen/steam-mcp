@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::steam::manifests::read_all_manifests;
 use crate::steam::paths::{SteamState, get_library_folders, get_user_config, steam_state};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, blocking};
 use crate::util::{format_bytes, read_dir_names, to_fixed};
 use crate::vdf::{VdfValue, parse_int, parse_vdf};
 
@@ -21,12 +21,10 @@ pub fn tool() -> Tool {
         destructive: false,
         open_world: false,
         handler: |args| {
-            boxed(async move {
-                match args.str("action").as_deref() {
-                    Some("queue") => ToolResult::or_error(queue(), "Error checking download queue"),
-                    Some("progress") => ToolResult::or_error(progress(&args), "Error checking download progress"),
-                    _ => status(),
-                }
+            blocking(move || match args.str("action").as_deref() {
+                Some("queue") => ToolResult::or_error(queue(), "Error checking download queue"),
+                Some("progress") => ToolResult::or_error(progress(&args), "Error checking download progress"),
+                _ => status(),
             })
         },
     }
@@ -138,9 +136,10 @@ fn progress(args: &Args) -> Result<ToolResult> {
                 (int("BytesToDownload"), int("BytesDownloaded"), int("BytesToStage"), int("BytesStaged"));
             let dl_pct = if to_dl > 0 { pct(dl, to_dl) } else { "N/A".to_string() };
             let stage_pct = if to_stage > 0 { pct(staged, to_stage) } else { "N/A".to_string() };
-            let total = to_dl + to_stage;
+            // Numbers from a manifest; saturate rather than wrap on nonsense values.
+            let total = to_dl.saturating_add(to_stage);
             let overall = if total > 0 {
-                pct(dl + staged, total)
+                pct(dl.saturating_add(staged), total)
             } else if flags == 4 {
                 "100%".to_string()
             } else {
