@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use crate::steam::manifests::read_all_manifests;
-use crate::steam::paths::{is_steam_running, open_steam_url};
+use crate::steam::paths::{open_steam_url, steam_may_be_running};
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::js_num;
 
@@ -52,7 +52,7 @@ fn not_installed(id: &str, what: &str) -> ToolResult {
 }
 
 fn run(action: &str, appid: f64) -> Result<ToolResult> {
-    if !is_steam_running() {
+    if !steam_may_be_running() {
         return Ok(ToolResult::error("Steam is not running. Please start Steam first."));
     }
     let id = js_num(appid);

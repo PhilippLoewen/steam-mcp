@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 
 use crate::steam::launch_options::{check_launch_options, check_mangohud_setting};
-use crate::steam::paths::is_steam_running;
+use crate::steam::paths::steam_may_be_running;
 use crate::steam::userdata::{get_app_launch_options, get_local_config, set_app_launch_options};
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{backup_file, home_dir, io_error, js_num, num, read_text, write_atomic};
@@ -88,7 +88,7 @@ const OBJECT_PROTOTYPE_KEYS: &[&str] = &[
     "toLocaleString",
 ];
 
-const STEAM_RUNNING_WARNING: &str = "WARNING: Steam is currently running!\nModifying localconfig.vdf while Steam is running will likely result in your changes being overwritten when Steam exits.\nPlease close Steam first, then try again.\n\nLaunch options were NOT modified.";
+const STEAM_RUNNING_WARNING: &str = "WARNING: Steam is currently running (or that couldn't be checked)!\nModifying localconfig.vdf while Steam is running will likely result in your changes being overwritten when Steam exits.\nPlease close Steam first, then try again.\n\nLaunch options were NOT modified.";
 
 const MANGOHUD_DEFAULTS: &str =
     "fps\ngpu_stats\ngpu_temp\ncpu_stats\ncpu_temp\nram\nvram\nframe_timing\nposition=top-left";
@@ -182,7 +182,7 @@ fn set_launch_opts(args: &Args) -> Result<ToolResult> {
              For anything else, set the launch options in Steam's game properties yourself."
         )));
     }
-    if is_steam_running() {
+    if steam_may_be_running() {
         return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
     }
 
@@ -221,7 +221,7 @@ fn presets(args: &Args) -> Result<ToolResult> {
         )));
     }
 
-    if is_steam_running() {
+    if steam_may_be_running() {
         return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
     }
 

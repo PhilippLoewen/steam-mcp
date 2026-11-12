@@ -178,26 +178,54 @@ pub fn open_steam_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a Steam client process is running.
-pub fn is_steam_running() -> bool {
+/// Whether the Steam client is running, as far as the process list tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteamState {
+    Running,
+    NotRunning,
+    /// The process list couldn't be read.
+    Unknown,
+}
+
+/// Look for the Steam client process: `steam` on Linux, `steam_osx` on
+/// macOS, `steam.exe` on Windows.
+pub fn steam_state() -> SteamState {
     if cfg!(windows) {
-        Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq steam.exe", "/NH"])
-            .stderr(Stdio::null())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("steam.exe"))
-            .unwrap_or(false)
+        match Command::new("tasklist").args(["/FI", "IMAGENAME eq steam.exe", "/NH"]).stderr(Stdio::null()).output() {
+            Ok(o) if o.status.success() => {
+                if String::from_utf8_lossy(&o.stdout).to_lowercase().contains("steam.exe") {
+                    SteamState::Running
+                } else {
+                    SteamState::NotRunning
+                }
+            }
+            _ => SteamState::Unknown,
+        }
     } else {
-        Command::new("pgrep")
-            .arg("-xi")
-            .arg("steam")
+        let status = Command::new("pgrep")
+            .args(["-xi", "steam(_osx)?"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .status();
+        pgrep_state(status.map(|s| s.code()))
     }
+}
+
+/// pgrep exits 0 on a match, 1 on none, higher on errors; a spawn failure or
+/// a kill by signal (no code) can't tell either.
+fn pgrep_state(code: std::io::Result<Option<i32>>) -> SteamState {
+    match code {
+        Ok(Some(0)) => SteamState::Running,
+        Ok(Some(1)) => SteamState::NotRunning,
+        _ => SteamState::Unknown,
+    }
+}
+
+/// Whether Steam may be running: for guards that refuse to edit files Steam
+/// would overwrite, where not knowing has to count as running.
+pub fn steam_may_be_running() -> bool {
+    steam_state() != SteamState::NotRunning
 }
 
 #[cfg(test)]
@@ -209,6 +237,15 @@ mod tests {
             Some(VdfValue::Obj(o)) => o,
             _ => panic!("no users"),
         }
+    }
+
+    #[test]
+    fn pgrep_failures_are_unknown() {
+        assert_eq!(pgrep_state(Ok(Some(0))), SteamState::Running);
+        assert_eq!(pgrep_state(Ok(Some(1))), SteamState::NotRunning);
+        assert_eq!(pgrep_state(Ok(Some(2))), SteamState::Unknown);
+        assert_eq!(pgrep_state(Ok(None)), SteamState::Unknown);
+        assert_eq!(pgrep_state(Err(std::io::Error::other("no pgrep"))), SteamState::Unknown);
     }
 
     #[test]

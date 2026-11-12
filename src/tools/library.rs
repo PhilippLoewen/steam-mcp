@@ -8,15 +8,15 @@ use serde_json::{Map, Value, json};
 use crate::steam::api::{has_api_key, steam_api_request, store_api_request};
 use crate::steam::categories::{
     Category, CategoryEdit, CategoryError, KEY_PREFIX, add_apps, create_category, delete_category, edit_categories,
-    find_category, parse_categories, random_collection_id, read_categories, remove_apps, rename_category,
-    steam_running_error,
+    find_category, parse_categories, random_collection_id, read_active_categories, read_categories, remove_apps,
+    rename_category, steam_running_error,
 };
 use crate::steam::library::get_libraries;
 use crate::steam::manifests::read_all_manifests;
 use crate::steam::millennium::{
     BridgeOptions, BridgeOutcome, BridgeRequest, bridge_category, run_bridge_edit, verify_bridge_edit,
 };
-use crate::steam::paths::{get_user_config, is_steam_running};
+use crate::steam::paths::{get_user_config, steam_may_be_running};
 use crate::steam::userdata::get_all_playtimes;
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{format_bytes, format_playtime, format_timestamp, locale_cmp, now_seconds};
@@ -65,6 +65,7 @@ pub trait CategoryEnv {
     fn steam_running(&self) -> bool;
     async fn bridge(&self, request: &BridgeRequest) -> Result<BridgeOutcome>;
     fn edit_file(&self, edit: &(dyn Fn(&str) -> Result<CategoryEdit> + Sync)) -> Result<CategoryEdit>;
+    /// The active account's categories, to check a bridge edit against.
     fn read_categories(&self) -> Result<Option<Vec<Category>>>;
     async fn app_names(&self, appids: &[i64]) -> HashMap<i64, String>;
 }
@@ -74,7 +75,7 @@ pub struct LiveEnv;
 
 impl CategoryEnv for LiveEnv {
     fn steam_running(&self) -> bool {
-        is_steam_running()
+        steam_may_be_running()
     }
 
     async fn bridge(&self, request: &BridgeRequest) -> Result<BridgeOutcome> {
@@ -86,7 +87,7 @@ impl CategoryEnv for LiveEnv {
     }
 
     fn read_categories(&self) -> Result<Option<Vec<Category>>> {
-        read_categories(false)
+        read_active_categories()
     }
 
     async fn app_names(&self, appids: &[i64]) -> HashMap<i64, String> {

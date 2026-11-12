@@ -10,10 +10,13 @@ use serde_json::Value;
 const STEAM_API_BASE: &str = "https://api.steampowered.com";
 const STORE_API_BASE: &str = "https://store.steampowered.com";
 
-/// The process-wide HTTP client.
+/// The process-wide HTTP client. Requests give up after 30 seconds, so a
+/// stalled server can't leave a tool call hanging.
 pub static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent(concat!("steam-mcp/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("HTTP client")
 });
