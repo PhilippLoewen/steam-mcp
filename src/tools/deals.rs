@@ -1,7 +1,5 @@
 //! deals: sale checks, wishlist, wishlist deals and library value estimates.
 
-use std::cmp::Ordering;
-
 use anyhow::{Result, bail};
 use futures::future::join_all;
 use serde_json::{Map, Value, json};
@@ -9,11 +7,9 @@ use serde_json::{Map, Value, json};
 use super::js::{encode_uri_component, fixed, js_str, number, truthy};
 use crate::steam::api::{HTTP, steam_api_request};
 use crate::steam::paths::get_user_config;
-use crate::steam::wishlist::fetch_all_wishlist_pages;
+use crate::steam::wishlist::{fetch_prices, fetch_store_details, fetch_wishlist};
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
-use crate::util::{js_num, js_sort, locale_cmp};
-
-const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+use crate::util::{format_timestamp, js_num, js_sort, locale_cmp};
 
 pub fn tool() -> Tool {
     Tool {
@@ -40,11 +36,6 @@ async fn handle(args: Args) -> ToolResult {
         Some("wishlist") => ToolResult::or_error(wishlist(&args).await, "Error fetching wishlist"),
         _ => ToolResult::or_error(library_value(&args).await, "Error estimating library value"),
     }
-}
-
-/// JS `a || b`.
-fn js_or<'a>(a: Option<&'a Value>, b: Option<&'a Value>) -> Option<&'a Value> {
-    if truthy(a) { a } else { b }
 }
 
 /// `v.key` in JS: throws on undefined and null, undefined for missing keys.
@@ -190,39 +181,35 @@ fn empty_wishlist(steamid: &str) -> ToolResult {
 
 async fn wishlist_deals(args: &Args) -> Result<ToolResult> {
     let steamid = steamid_arg(args)?;
-    let all_items = fetch_all_wishlist_pages(&steamid).await?;
-    if all_items.is_empty() {
+    let items = fetch_wishlist(&steamid).await?;
+    if items.is_empty() {
         return Ok(empty_wishlist(&steamid));
     }
+    let appids: Vec<i64> = items.iter().map(|i| i.appid).collect();
+    // One after the other, so no more than CONCURRENCY store requests run at once.
+    let details = fetch_store_details(&appids).await;
+    let prices = fetch_prices(&appids).await;
 
-    let mut deals = Vec::new();
-    for item in &all_items {
-        if truthy(item.get("free")) || truthy(item.get("is_free_game")) {
-            continue;
-        }
-        let Some(Value::Array(subs)) = item.get("subs") else { continue };
-        let mut discounted = Vec::new();
-        for sub in subs {
-            if number(read(Some(sub), "discount_pct")?) > 0.0 {
-                discounted.push(sub);
-            }
-        }
-        js_sort(&mut discounted, |a, b| number(b.get("discount_pct")) - number(a.get("discount_pct")));
-        let Some(best) = discounted.first() else { continue };
-
-        let mut deal = Map::new();
-        put(&mut deal, "appid", item.get("appid"));
-        put(&mut deal, "name", item.get("name"));
-        put(&mut deal, "discount_percent", best.get("discount_pct"));
-        put(&mut deal, "price", best.get("price"));
-        put(&mut deal, "review_desc", item.get("review_desc"));
-        deals.push(deal);
-    }
+    let mut deals: Vec<Map<String, Value>> = items
+        .iter()
+        .filter_map(|item| {
+            let price = prices.get(&item.appid).filter(|p| p.discount_percent > 0)?;
+            let info = details.get(&item.appid).cloned().unwrap_or_default();
+            let mut deal = Map::new();
+            deal.insert("appid".into(), item.appid.into());
+            deal.insert("name".into(), info.name.into());
+            deal.insert("discount_percent".into(), price.discount_percent.into());
+            deal.insert("price".into(), price.final_formatted.clone().into());
+            deal.insert("original_price".into(), price.initial_formatted.clone().into());
+            deal.insert("review_desc".into(), info.review_desc.into());
+            Some(deal)
+        })
+        .collect();
     js_sort(&mut deals, |a, b| number(b.get("discount_percent")) - number(a.get("discount_percent")));
 
     Ok(ToolResult::json(&json!({
         "steamid": steamid,
-        "total_wishlist_items": all_items.len(),
+        "total_wishlist_items": items.len(),
         "deals_found": deals.len(),
         "deals": deals,
     })))
@@ -230,62 +217,49 @@ async fn wishlist_deals(args: &Args) -> Result<ToolResult> {
 
 async fn wishlist(args: &Args) -> Result<ToolResult> {
     let steamid = steamid_arg(args)?;
-    let all_items = fetch_all_wishlist_pages(&steamid).await?;
-    if all_items.is_empty() {
+    let items = fetch_wishlist(&steamid).await?;
+    if items.is_empty() {
         return Ok(empty_wishlist(&steamid));
     }
+    let appids: Vec<i64> = items.iter().map(|i| i.appid).collect();
+    // One after the other, so no more than CONCURRENCY store requests run at once.
+    let details = fetch_store_details(&appids).await;
+    let prices = fetch_prices(&appids).await;
 
-    let mut items = Vec::with_capacity(all_items.len());
-    for item in &all_items {
-        let free = js_or(item.get("free"), item.get("is_free_game"));
-        let price = if truthy(free) {
-            "Free".into()
-        } else if let Some(Value::Array(subs)) = item.get("subs")
-            && let Some(sub) = subs.first()
-        {
-            let price = read(Some(sub), "price")?;
-            let pct = read(Some(sub), "discount_pct")?;
-            json!({
-                "price": js_or(price, None).cloned().unwrap_or_else(|| "N/A".into()),
-                "discount_pct": js_or(pct, None).cloned().unwrap_or_else(|| 0.into()),
-            })
-        } else {
-            "N/A".into()
-        };
+    let mut out_items: Vec<Map<String, Value>> = items
+        .iter()
+        .map(|item| {
+            let info = details.get(&item.appid).cloned().unwrap_or_default();
+            let price = match prices.get(&item.appid) {
+                _ if info.is_free => "Free".into(),
+                Some(p) => json!({ "price": p.final_formatted, "discount_pct": p.discount_percent }),
+                None => "N/A".into(),
+            };
+            let mut out = Map::new();
+            out.insert("appid".into(), item.appid.into());
+            out.insert("name".into(), info.name.into());
+            out.insert("priority".into(), item.priority.into());
+            out.insert("review_desc".into(), info.review_desc.into());
+            out.insert("release_date".into(), info.release_date.into());
+            out.insert("added".into(), format_timestamp(item.date_added).into());
+            out.insert("free".into(), info.is_free.into());
+            out.insert("price".into(), price);
+            out
+        })
+        .collect();
 
-        let mut out = Map::new();
-        put(&mut out, "appid", item.get("appid"));
-        put(&mut out, "name", item.get("name"));
-        put(&mut out, "priority", item.get("priority"));
-        put(&mut out, "review_desc", item.get("review_desc"));
-        put(&mut out, "release_date", item.get("release_string"));
-        put(&mut out, "free", free);
-        out.insert("price".into(), price);
-        put(&mut out, "type", item.get("type"));
-        items.push(out);
-    }
-
-    let priority = |m: &Map<String, Value>| match m.get("priority") {
-        Some(Value::Number(n)) if n.as_f64() == Some(0.0) => MAX_SAFE_INTEGER,
-        p => number(p),
+    // Ranked items first by rank, unranked (priority 0) last; then by name.
+    let rank = |m: &Map<String, Value>| match m.get("priority").and_then(Value::as_i64) {
+        Some(0) | None => i64::MAX,
+        Some(p) => p,
     };
-    js_sort(&mut items, |a, b| {
-        let (pa, pb) = (priority(a), priority(b));
-        if pa != pb {
-            return pa - pb;
-        }
-        let name = |m: &Map<String, Value>| m.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-        match locale_cmp(&name(a), &name(b)) {
-            Ordering::Less => -1.0,
-            Ordering::Equal => 0.0,
-            Ordering::Greater => 1.0,
-        }
-    });
+    let name = |m: &Map<String, Value>| m.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+    out_items.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| locale_cmp(&name(a), &name(b))));
 
     Ok(ToolResult::json(&json!({
         "steamid": steamid,
-        "total_count": items.len(),
-        "items": items,
+        "total_count": out_items.len(),
+        "items": out_items,
     })))
 }
 

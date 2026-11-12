@@ -80,7 +80,7 @@ Add a `.mcp.json` in your project root, or add to `~/.claude.json` for system-wi
 }
 ```
 
-> **Note:** The `STEAM_API_KEY` is optional. Most tools work without it. Only a few actions (achievements, friends, owned games, wishlist, profile) require it. Get your key at [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey).
+> **Note:** The `STEAM_API_KEY` is optional. Most tools work without it. Only a few actions (achievements, friends, owned games, profile) require it. The wishlist needs no key, but it must be public. Get your key at [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey).
 
 ### Category filtering
 
@@ -159,7 +159,7 @@ Variable values can't contain paths. Variables that run a program or load a file
 
 For `shortcuts add`, the program must be an existing executable, given by absolute path; a symlink is saved as the file it points to. On Linux and macOS, neither the program nor its start folder may be somewhere anyone can write to, such as `/tmp`. The program can't be a shell, interpreter, `wine`, terminal or other program that runs whatever its arguments say; this list is best effort, not a guarantee. On Windows, only `.exe` programs outside the temp folder are accepted. `import_lutris` doesn't take a program from the model: every imported shortcut runs `lutris` with the game's Lutris id.
 
-MangoHud `set` refuses the keys that run commands, write files or upload logs (`exec`, `output_folder`, `output_file`, `control`, `upload_log`, `upload_logs`, `permit_upload`). It works on the global config only, because MangoHud finds per-game configs by program name, not by Steam appid.
+MangoHud `set` refuses the keys that run commands, write files or upload logs (`exec`, `output_folder`, `output_file`, `control`, `upload_log`, `upload_logs`, `permit_upload`). Without `appid` it edits the global config. With `appid` it edits `~/.config/MangoHud/steam-mcp/<appid>.conf` and adds `env MANGOHUD_CONFIGFILE=<that file>` before `%command%` in the game's launch options, since MangoHud finds per-game configs only by program name; that needs Steam closed. Turn MangoHud itself on with the `mangohud` preset.
 
 Edits to `localconfig.vdf`, `shortcuts.vdf` and MangoHud configs are atomic. The previous version is kept as `<file>.<time>.bak`, and the newest five backups are kept. A `localconfig.vdf` or `shortcuts.vdf` that can't be read back exactly (damaged, cut off, not UTF-8) is left alone.
 
@@ -261,7 +261,7 @@ Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talk
 | `get_launch_opts` | Read current launch options |
 | `set_launch_opts` | Set launch options ([accepted forms](#what-the-tools-may-write)) |
 | `presets` | List/apply launch option presets (MangoHud, GameMode, Vulkan, etc.) |
-| `mangohud` | Show, set, or reset the global MangoHud configuration |
+| `mangohud` | Show, set, or reset the global or a game's MangoHud configuration |
 | `steam_settings` | View Steam client settings |
 
 ### `player` — Player data (most actions require API key)
@@ -372,7 +372,7 @@ src/
 │   ├── categories.rs        # Library categories (cloud-storage-namespace-1.json) read/write
 │   ├── millennium.rs        # Live category edits via the Millennium bridge plugin
 │   ├── api.rs               # Steam Web API / Store API client
-│   └── wishlist.rs          # Wishlist data fetching
+│   └── wishlist.rs          # Wishlist, store details and prices
 └── tools/                   # 14 consolidated MCP tools (one file per tool)
 millennium-plugin/           # steam-mcp-bridge: Millennium plugin for live category edits
 ```

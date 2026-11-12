@@ -138,7 +138,10 @@ async fn resolve_app_names(appids: &[i64]) -> HashMap<i64, String> {
         }
         entry["data"]["name"].as_str().filter(|n| !n.is_empty()).map(|n| (appid, n.to_string()))
     });
-    names.extend(futures::future::join_all(lookups).await.into_iter().flatten());
+    // A few at a time: a category can list thousands of apps.
+    let found: Vec<Option<(i64, String)>> =
+        futures::StreamExt::collect(futures::StreamExt::buffer_unordered(futures::stream::iter(lookups), 8)).await;
+    names.extend(found.into_iter().flatten());
     names
 }
 

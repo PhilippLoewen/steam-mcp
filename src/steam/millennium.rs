@@ -299,17 +299,29 @@ async fn bridge_exchange(
     let exchange: Result<Option<Map<String, Value>>> = async {
         let set = json!({ "name": BRIDGE_PLUGIN, "key": request_key, "value": request.to_json().to_string() });
         client.call("plugin.config.set", set, CALL_TIMEOUT).await?;
+        // Every call and pause is cut to the time left, so the wait ends at the deadline.
         let deadline = tokio::time::Instant::now() + options.timeout;
-        while tokio::time::Instant::now() < deadline {
-            let got = client
-                .call("plugin.config.get", json!({ "name": BRIDGE_PLUGIN, "key": response_key }), CALL_TIMEOUT)
-                .await?;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            let params = json!({ "name": BRIDGE_PLUGIN, "key": response_key });
+            let got = match client.call("plugin.config.get", params, CALL_TIMEOUT.min(left)).await {
+                Ok(got) => got,
+                Err(_) if tokio::time::Instant::now() >= deadline => return Ok(None),
+                Err(e) => return Err(e),
+            };
             match got.get("value") {
                 Some(v) if truthy(v) => return Ok(Some(v.as_object().cloned().unwrap_or_default())),
-                _ => tokio::time::sleep(options.poll).await,
+                _ => {
+                    tokio::time::sleep(
+                        options.poll.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    )
+                    .await
+                }
             }
         }
-        Ok(None)
     }
     .await;
 
@@ -320,10 +332,14 @@ async fn bridge_exchange(
     })?;
 
     let Some(response) = response else {
-        for key in [&request_key, &response_key] {
-            let _ =
-                client.call("plugin.config.delete", json!({ "name": BRIDGE_PLUGIN, "key": key }), CALL_TIMEOUT).await;
-        }
+        // Withdraw the request and any late answer, but don't wait long for a slow Millennium.
+        let withdraw = async {
+            for key in [&request_key, &response_key] {
+                let params = json!({ "name": BRIDGE_PLUGIN, "key": key });
+                let _ = client.call("plugin.config.delete", params, CALL_TIMEOUT).await;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(1), withdraw).await;
         return Err(CategoryError::timeout(format!(
             "The {BRIDGE_PLUGIN} Millennium plugin did not answer within {}s; the edit may or may not have been applied.",
             js_num(options.timeout.as_secs_f64())
@@ -426,6 +442,8 @@ mod tests {
         plugin: Option<Plugin>,
         config: Arc<Mutex<HashMap<String, Value>>>,
         calls: Arc<Mutex<Vec<String>>>,
+        /// How long plugin.config.get takes to answer.
+        get_delay: Duration,
     }
 
     fn installed() -> Fake {
@@ -478,6 +496,7 @@ mod tests {
                                         (json!({ "success": true }), Value::Null)
                                     }
                                     "plugin.config.get" => {
+                                        tokio::time::sleep(fake.get_delay).await;
                                         let value =
                                             fake.config.lock().unwrap().get(&key).cloned().unwrap_or(Value::Null);
                                         (json!({ "value": value }), Value::Null)
@@ -598,6 +617,20 @@ mod tests {
         let err = run_bridge_edit(&BridgeRequest::Delete { name: "Nope".into() }, &opts).await.unwrap_err();
         let ce = err.downcast_ref::<CategoryError>().expect("CategoryError");
         assert!(ce.message.contains("not found") && !ce.bridge_timeout);
+    }
+
+    #[tokio::test]
+    async fn a_slow_millennium_doesnt_stretch_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = BridgeOptions { timeout: Duration::from_millis(200), ..options(&dir) };
+        // Each answer takes longer than the whole timeout.
+        let fake = Fake { get_delay: Duration::from_secs(3), ..installed() };
+        let _server = serve(&opts.socket_path, fake);
+        let started = std::time::Instant::now();
+        let err = run_bridge_edit(&create(), &opts).await.unwrap_err();
+        assert!(err.downcast_ref::<CategoryError>().is_some_and(|e| e.bridge_timeout), "{err}");
+        // The deadline plus the clean-up calls, not the 3 s answer.
+        assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
     }
 
     #[tokio::test]

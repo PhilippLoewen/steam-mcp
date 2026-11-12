@@ -1,7 +1,7 @@
 //! game_config: launch options, launch presets, MangoHud configs and Steam client settings.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -315,24 +315,106 @@ fn js_object(entries: &IndexMap<String, String>) -> Map<String, Value> {
     index.into_iter().map(|(_, k, v)| (k, v)).chain(rest).map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect()
 }
 
+/// The per-game config steam-mcp keeps for `appid`. MangoHud finds per-game
+/// configs only by program name, so the game's launch options point it here.
+fn mangohud_game_config(mango_dir: &Path, appid: i64) -> PathBuf {
+    mango_dir.join("steam-mcp").join(format!("{appid}.conf"))
+}
+
+/// `current` launch options made to load MangoHud's config from `path`: an
+/// existing MANGOHUD_CONFIGFILE= value is replaced, else `env
+/// MANGOHUD_CONFIGFILE=<path>` goes right before %command%, where it reaches
+/// the game behind any wrappers or shell syntax the user has. Game arguments
+/// without %command% become `env … %command% <arguments>`.
+/// An existing value is only replaced when it is a plain path ending at
+/// whitespace or the end; a quoted or escaped one, or one followed directly by
+/// shell syntax, is refused rather than guessed at.
+fn with_mangohud_config_file(current: &str, path: &str) -> Result<String, String> {
+    const VAR: &str = "MANGOHUD_CONFIGFILE=";
+    let assignment = format!("{VAR}{path}");
+    if let Some(start) = current.find(VAR).filter(|&i| i == 0 || current[..i].ends_with([' ', '\t'])) {
+        let value_start = start + VAR.len();
+        let value_end = current[value_start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || "_./-".contains(c)))
+            .map_or(current.len(), |n| value_start + n);
+        if !current[value_end..].is_empty() && !current[value_end..].starts_with([' ', '\t']) {
+            return Err("the launch options already set MANGOHUD_CONFIGFILE in a form steam-mcp can't edit \
+                        safely (quoted, escaped or followed by shell syntax); change it in Steam yourself"
+                .into());
+        }
+        return Ok(format!("{}{assignment}{}", &current[..start], &current[value_end..]));
+    }
+    Ok(match current.find("%command%") {
+        Some(at) => format!("{}env {assignment} {}", &current[..at], &current[at..]),
+        None => format!("env {assignment} %command% {}", current.trim()).trim_end().to_string(),
+    })
+}
+
+/// Whether launch options turn MangoHud on (the wrapper or MANGOHUD=1).
+fn mangohud_enabled(options: &str) -> bool {
+    options.split_whitespace().any(|w| w == "mangohud" || w == "MANGOHUD=1")
+}
+
 fn mangohud(args: &Args) -> Result<ToolResult> {
     let _guard = crate::util::file_edit_lock();
     let mango_action = args.str("mangohud_action").unwrap_or_else(|| "show".to_string());
     let mango_dir = home_dir().join(".config").join("MangoHud");
     let global_path = mango_dir.join("MangoHud.conf");
-    let appid = truthy_appid(args);
-    let game = appid.map(|id| {
-        (format!("game-specific (appid: {})", js_num(id)), mango_dir.join(format!("wine-{}.conf", js_num(id))))
-    });
+    let appid = match truthy_appid(args) {
+        Some(id) => Some(integral_appid(id)?),
+        None => None,
+    };
+    let game = appid.map(|id| (format!("game-specific (appid: {id})"), mangohud_game_config(&mango_dir, id)));
     let (scope, config_path) = game.clone().unwrap_or_else(|| ("global".to_string(), global_path.clone()));
 
-    if game.is_some() && mango_action != "show" {
-        return Ok(ToolResult::error(
-            "MangoHud can't apply per-game settings by Steam appid: it finds per-game configs by the \
-             running program's name, so a file named after the appid is never read. Leave out appid to \
-             change the global config.",
-        ));
-    }
+    // A per-game edit also points the game's launch options at its config.
+    let launch_update = match (appid, mango_action.as_str()) {
+        (Some(id), "set" | "reset") => {
+            let path = config_path.to_string_lossy().into_owned();
+            if !path.chars().all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c)) {
+                return Ok(ToolResult::error(format!(
+                    "MangoHud config NOT modified: the per-game config path {path:?} has characters that \
+                     launch options can't carry unquoted. Set MANGOHUD_CONFIGFILE in Steam yourself."
+                )));
+            }
+            if steam_may_be_running() {
+                return Ok(ToolResult::error(format!(
+                    "{STEAM_RUNNING_WARNING}\nA per-game MangoHud config needs the game's launch options \
+                     changed, so the MangoHud config was NOT modified either."
+                )));
+            }
+            let current = get_app_launch_options(id)?.unwrap_or_default();
+            let updated = match with_mangohud_config_file(&current, &path) {
+                Ok(updated) => updated,
+                Err(why) => return Ok(ToolResult::error(format!("MangoHud config NOT modified: {why}."))),
+            };
+            Some((id, current, updated))
+        }
+        _ => None,
+    };
+    let write_config = |content: &str| -> Result<()> {
+        let dir = config_path.parent().unwrap_or(&mango_dir);
+        fs::create_dir_all(dir).map_err(|e| io_error(&e, "mkdir", dir))?;
+        backup_file(&config_path).map_err(|e| io_error(&e, "backup", &config_path))?;
+        write_atomic(&config_path, content.as_bytes()).map_err(|e| io_error(&e, "open", &config_path))?;
+        if let Some((id, current, updated)) = &launch_update
+            && updated != current
+        {
+            set_app_launch_options(*id, updated)?;
+        }
+        Ok(())
+    };
+    let launch_json = |out: &mut Map<String, Value>| {
+        if let Some((_, _, updated)) = &launch_update {
+            out.insert("launchOptions".into(), updated.clone().into());
+            if !mangohud_enabled(updated) {
+                out.insert(
+                    "note".into(),
+                    "MangoHud isn't turned on for this game yet; apply the mangohud preset to see the overlay.".into(),
+                );
+            }
+        }
+    };
 
     match mango_action.as_str() {
         "show" => {
@@ -391,31 +473,28 @@ fn mangohud(args: &Args) -> Result<ToolResult> {
                 }
             }
 
-            fs::create_dir_all(&mango_dir).map_err(|e| io_error(&e, "mkdir", &mango_dir))?;
-            backup_file(&config_path).map_err(|e| io_error(&e, "backup", &config_path))?;
             let content = lines.join("\n");
-            write_atomic(&config_path, content.as_bytes()).map_err(|e| io_error(&e, "open", &config_path))?;
+            write_config(&content)?;
 
-            Ok(ToolResult::json(&json!({
-                "action": "set",
-                "scope": scope,
-                "path": config_path.to_string_lossy(),
-                "updatedSettings": js_object(&new_settings),
-                "config": content,
-            })))
+            let mut out = Map::new();
+            out.insert("action".into(), "set".into());
+            out.insert("scope".into(), scope.into());
+            out.insert("path".into(), config_path.to_string_lossy().into());
+            out.insert("updatedSettings".into(), js_object(&new_settings).into());
+            out.insert("config".into(), content.into());
+            launch_json(&mut out);
+            Ok(ToolResult::json(&Value::Object(out)))
         }
         _ => {
-            fs::create_dir_all(&mango_dir).map_err(|e| io_error(&e, "mkdir", &mango_dir))?;
-            backup_file(&config_path).map_err(|e| io_error(&e, "backup", &config_path))?;
-            write_atomic(&config_path, format!("{MANGOHUD_DEFAULTS}\n").as_bytes())
-                .map_err(|e| io_error(&e, "open", &config_path))?;
-            Ok(ToolResult::json(&json!({
-                "action": "reset",
-                "scope": scope,
-                "path": config_path.to_string_lossy(),
-                "config": MANGOHUD_DEFAULTS,
-                "message": "MangoHud config reset to sensible defaults.",
-            })))
+            write_config(&format!("{MANGOHUD_DEFAULTS}\n"))?;
+            let mut out = Map::new();
+            out.insert("action".into(), "reset".into());
+            out.insert("scope".into(), scope.into());
+            out.insert("path".into(), config_path.to_string_lossy().into());
+            out.insert("config".into(), MANGOHUD_DEFAULTS.into());
+            out.insert("message".into(), "MangoHud config reset to sensible defaults.".into());
+            launch_json(&mut out);
+            Ok(ToolResult::json(&Value::Object(out)))
         }
     }
 }
@@ -504,6 +583,54 @@ mod tests {
         for preset in PRESETS {
             assert_eq!(check_launch_options(preset.options), Ok(()), "{}", preset.name);
         }
+    }
+
+    #[test]
+    fn points_launch_options_at_the_mangohud_config() {
+        let p = "/home/u/.config/MangoHud/steam-mcp/10.conf";
+        let cases = [
+            ("", format!("env MANGOHUD_CONFIGFILE={p} %command%")),
+            ("-novid -high", format!("env MANGOHUD_CONFIGFILE={p} %command% -novid -high")),
+            ("%command%", format!("env MANGOHUD_CONFIGFILE={p} %command%")),
+            ("mangohud %command% -dx12", format!("mangohud env MANGOHUD_CONFIGFILE={p} %command% -dx12")),
+            (
+                "gamescope -f -- gamemoderun %command%",
+                format!("gamescope -f -- gamemoderun env MANGOHUD_CONFIGFILE={p} %command%"),
+            ),
+            ("cd /x; %command%", format!("cd /x; env MANGOHUD_CONFIGFILE={p} %command%")),
+            (
+                "mangohud env MANGOHUD_CONFIGFILE=/old.conf %command%",
+                format!("mangohud env MANGOHUD_CONFIGFILE={p} %command%"),
+            ),
+            ("MANGOHUD_CONFIGFILE=/old.conf\t%command%", format!("MANGOHUD_CONFIGFILE={p}\t%command%")),
+        ];
+        for (current, expected) in cases {
+            assert_eq!(with_mangohud_config_file(current, p), Ok(expected), "{current:?}");
+        }
+        // Applying it twice changes nothing more.
+        let once = with_mangohud_config_file("mangohud %command%", p).unwrap();
+        assert_eq!(with_mangohud_config_file(&once, p), Ok(once));
+        // Values it can't delimit safely are refused, not cut.
+        for current in [
+            "env MANGOHUD_CONFIGFILE=\"/home/u/old config.conf\" %command%",
+            "MANGOHUD_CONFIGFILE=/old.conf;%command%",
+            "MANGOHUD_CONFIGFILE=/old\\ x.conf %command%",
+            "MANGOHUD_CONFIGFILE=$HOME/x.conf %command%",
+        ] {
+            assert!(with_mangohud_config_file(current, p).is_err(), "{current:?}");
+        }
+        // The merged result still takes presets.
+        assert_eq!(
+            merge_launch_options(&with_mangohud_config_file("", p).unwrap(), "gamemoderun %command%"),
+            format!("gamemoderun env MANGOHUD_CONFIGFILE={p} %command%")
+        );
+    }
+
+    #[test]
+    fn detects_mangohud_in_launch_options() {
+        assert!(mangohud_enabled("mangohud %command%"));
+        assert!(mangohud_enabled("MANGOHUD=1 %command%"));
+        assert!(!mangohud_enabled("env MANGOHUD_CONFIGFILE=/x.conf %command%"));
     }
 
     #[test]

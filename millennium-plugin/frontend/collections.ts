@@ -189,6 +189,59 @@ async function deleteCollection(query: string): Promise<BridgeResult> {
 	return { changed: true, id: collection.id };
 }
 
+/** Longest category name and largest appid list a request may carry. */
+const MAX_NAME_LENGTH = 256;
+const MAX_APPIDS = 10_000;
+
+function requireName(value: unknown, field: string): string {
+	if (typeof value !== 'string' || !value.trim() || value.length > MAX_NAME_LENGTH) {
+		throw new Error(`"${field}" must be a non-empty string of at most ${MAX_NAME_LENGTH} characters`);
+	}
+	return value;
+}
+
+/**
+ * Parse and check a request from the config key. Any local program that can
+ * reach Millennium's socket can write one, so nothing is trusted: the action
+ * must be known, names non-empty strings, appids a bounded list of positive
+ * whole numbers.
+ */
+export function parseRequest(raw: string): Request {
+	let data: unknown;
+	try {
+		data = JSON.parse(raw);
+	} catch {
+		throw new Error('The request is not valid JSON');
+	}
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+		throw new Error('The request must be a JSON object');
+	}
+	const fields = data as Record<string, unknown>;
+	const action = fields.action;
+	switch (action) {
+		case 'add':
+		case 'remove': {
+			const appids = fields.appids;
+			if (
+				!Array.isArray(appids) ||
+				appids.length === 0 ||
+				appids.length > MAX_APPIDS ||
+				!appids.every((id) => Number.isSafeInteger(id) && (id as number) > 0)
+			) {
+				throw new Error(`"appids" must be a list of 1 to ${MAX_APPIDS} positive whole numbers`);
+			}
+			return { action, name: requireName(fields.name, 'name'), appids: appids as number[] };
+		}
+		case 'create':
+		case 'delete':
+			return { action, name: requireName(fields.name, 'name') };
+		case 'rename':
+			return { action, name: requireName(fields.name, 'name'), newName: requireName(fields.newName, 'newName') };
+		default:
+			throw new Error(`Unknown action ${JSON.stringify(action)}`);
+	}
+}
+
 export function handle(request: Request): Promise<BridgeResult> {
 	switch (request.action) {
 		case 'add':
