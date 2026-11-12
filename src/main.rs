@@ -1,7 +1,9 @@
 //! steam-mcp: an MCP server over stdio for the local Steam library.
 //!
 //! STEAM_TOOLS=core,compat,... limits the registered tool categories;
-//! unset, all are registered.
+//! unset, all are registered. STEAM_MCP_READONLY switches off every action
+//! that writes (server.rs); STEAM_MCP_OUTPUT_DIR moves the output folder
+//! for exports and backups (output.rs).
 
 mod output;
 mod server;
