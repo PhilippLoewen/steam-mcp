@@ -297,6 +297,16 @@ impl Args {
     }
 }
 
+/// Run a handler that only does synchronous work (file walks, process waits,
+/// locks) on tokio's blocking pool, so it can't stall the async workers.
+pub fn blocking(f: impl FnOnce() -> ToolResult + Send + 'static) -> ToolFuture {
+    Box::pin(async move {
+        tokio::task::spawn_blocking(f)
+            .await
+            .unwrap_or_else(|e| ToolResult::error(format!("The tool stopped unexpectedly: {e}")))
+    })
+}
+
 /// Box an async handler body into a [`ToolFuture`].
 pub fn boxed<F: Future<Output = ToolResult> + Send + 'static>(f: F) -> ToolFuture {
     Box::pin(f)

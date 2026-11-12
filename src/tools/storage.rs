@@ -10,11 +10,11 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 
 use crate::output;
-use crate::steam::compat::{get_all_proton_version_mappings, get_installed_proton_versions};
+use crate::steam::compat::{get_all_proton_version_mappings, get_installed_proton_versions, is_runtime, tool_ids};
 use crate::steam::library::{LibraryFolder, get_libraries};
 use crate::steam::manifests::{AppManifest, read_all_manifests};
 use crate::steam::paths::{get_steam_dir, get_user_data_dir};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, blocking};
 use crate::util::{dir_size, format_bytes, io_error, js_num, locale_cmp, num, read_text, sorted_entries};
 use crate::vdf::{VdfExt, VdfValue, js_entries, parse_int, parse_vdf};
 
@@ -31,7 +31,7 @@ pub fn tool() -> Tool {
             Param::new("sort_by", ParamType::Enum(&["name", "size"])),
             Param::new("limit", ParamType::Number),
         ],
-        handler: |args| boxed(async move { handle(&args) }),
+        handler: |args| blocking(move || handle(&args)),
         writes: &[Write::Action("backup")],
         destructive: false,
         open_world: false,
@@ -140,27 +140,30 @@ fn disk_report() -> Result<ToolResult> {
     }
 
     let mut games: IndexMap<i64, Usage> = IndexMap::new();
-    let (mut total_install, mut total_compat, mut total_shader, mut total_workshop) = (0, 0, 0, 0);
+    let (mut total_install, mut total_compat, mut total_shader, mut total_workshop) = (0i64, 0i64, 0i64, 0i64);
     for m in &manifests {
         ensure(&mut games, &names, m.appid).install = m.size_on_disk;
-        total_install += m.size_on_disk;
+        total_install = total_install.saturating_add(m.size_on_disk);
     }
     for steamapps in mounted(&libraries) {
         for d in list_appid_dirs(&steamapps.join("compatdata")) {
-            ensure(&mut games, &names, d.appid).compatdata += d.size;
-            total_compat += d.size;
+            let u = ensure(&mut games, &names, d.appid);
+            u.compatdata = u.compatdata.saturating_add(d.size);
+            total_compat = total_compat.saturating_add(d.size);
         }
         for d in list_appid_dirs(&steamapps.join("shadercache")) {
-            ensure(&mut games, &names, d.appid).shadercache += d.size;
-            total_shader += d.size;
+            let u = ensure(&mut games, &names, d.appid);
+            u.shadercache = u.shadercache.saturating_add(d.size);
+            total_shader = total_shader.saturating_add(d.size);
         }
         for d in list_appid_dirs(&steamapps.join("workshop").join("content")) {
-            ensure(&mut games, &names, d.appid).workshop += d.size;
-            total_workshop += d.size;
+            let u = ensure(&mut games, &names, d.appid);
+            u.workshop = u.workshop.saturating_add(d.size);
+            total_workshop = total_workshop.saturating_add(d.size);
         }
     }
     for u in games.values_mut() {
-        u.total = u.install + u.compatdata + u.shadercache + u.workshop;
+        u.total = saturating_sum(&[u.install, u.compatdata, u.shadercache, u.workshop]);
     }
 
     let mut sorted: Vec<(i64, Usage)> = games.into_iter().collect();
@@ -181,7 +184,7 @@ fn disk_report() -> Result<ToolResult> {
         .collect();
 
     Ok(ToolResult::json(&json!({
-        "totalFootprint": fmt(total_install + total_compat + total_shader + total_workshop),
+        "totalFootprint": fmt(saturating_sum(&[total_install, total_compat, total_shader, total_workshop])),
         "breakdown": {
             "installs": fmt(total_install),
             "compatdata": fmt(total_compat),
@@ -269,10 +272,12 @@ fn cleanup() -> Result<ToolResult> {
         never_played.iter().map(|m| json!({ "appid": m.appid, "name": m.name, "size": fmt(m.size_on_disk) })).collect();
 
     let mappings = get_all_proton_version_mappings()?;
-    let used: HashSet<&str> = manifests.iter().filter_map(|m| mappings.get(&m.appid).map(String::as_str)).collect();
+    // Tools picked for an installed game, plus the default for all games (appid 0).
+    let used: HashSet<&str> =
+        manifests.iter().map(|m| m.appid).chain([0]).filter_map(|id| mappings.get(&id).map(String::as_str)).collect();
     let unused_proton: Vec<Value> = get_installed_proton_versions()?
         .iter()
-        .filter(|v| !used.contains(v.name.as_str()))
+        .filter(|v| !is_runtime(v) && !tool_ids(v).iter().any(|id| used.contains(id.as_str())))
         .map(|v| json!({ "name": v.name, "path": path_str(&v.path), "size": format_bytes(v.size as f64) }))
         .collect();
 
@@ -522,6 +527,11 @@ fn symlink(target: &Path, link: &Path) -> Result<()> {
     copy().map_err(|e| io_error(&e, "symlink", link))
 }
 
+/// Sizes come from manifests and the disk; add them without wrapping on nonsense values.
+fn saturating_sum(values: &[i64]) -> i64 {
+    values.iter().fold(0, |sum, v| sum.saturating_add(*v))
+}
+
 /// Whether either folder is inside the other (or they are the same).
 fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
@@ -601,6 +611,12 @@ fn backup(args: &Args) -> Result<ToolResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_add_up_without_wrapping() {
+        assert_eq!(saturating_sum(&[i64::MAX, 10, 20]), i64::MAX);
+        assert_eq!(saturating_sum(&[1, 2, 3]), 6);
+    }
 
     #[test]
     fn overlap_is_containment_either_way() {

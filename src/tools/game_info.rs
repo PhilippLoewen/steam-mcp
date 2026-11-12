@@ -3,10 +3,11 @@
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
+use super::js::{encode_uri_component, fixed, js_str, number, truthy};
 use crate::steam::api::HTTP;
 use crate::steam::paths::get_user_data_dir;
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
-use crate::util::{iso_from_millis, js_num, num, to_fixed};
+use crate::util::{iso_from_millis, js_num, num};
 use crate::vdf::{is_array_index, parse_int};
 
 const CDN_BASE: &str = "https://cdn.akamai.steamstatic.com/steam/apps";
@@ -62,31 +63,6 @@ fn appid_arg(args: &Args) -> Option<f64> {
     args.f64("appid").filter(|a| *a != 0.0 && !a.is_nan())
 }
 
-fn truthy(v: Option<&Value>) -> bool {
-    match v {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(_) => true,
-    }
-}
-
-/// `${v}` in a JS template string.
-fn js_str(v: Option<&Value>) -> String {
-    match v {
-        None => "undefined".into(),
-        Some(Value::Null) => "null".into(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Number(n)) => js_num(n.as_f64().unwrap_or(f64::NAN)),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => {
-            a.iter().map(|e| if e.is_null() { String::new() } else { js_str(Some(e)) }).collect::<Vec<_>>().join(",")
-        }
-        Some(Value::Object(_)) => "[object Object]".into(),
-    }
-}
-
 /// `v.key` in JS: throws on undefined and null, undefined for missing keys.
 fn read<I>(v: Option<&Value>, key: I) -> Result<Option<&Value>>
 where
@@ -103,19 +79,6 @@ where
 fn put(dst: &mut Map<String, Value>, as_key: &str, v: Option<&Value>) {
     if let Some(v) = v {
         dst.insert(as_key.into(), v.clone());
-    }
-}
-
-fn number(v: Option<&Value>) -> f64 {
-    match v {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
-        Some(Value::Null) => 0.0,
-        Some(Value::Bool(b)) => f64::from(u8::from(*b)),
-        Some(Value::String(s)) => {
-            let t = s.trim();
-            if t.is_empty() { 0.0 } else { t.parse().unwrap_or(f64::NAN) }
-        }
-        _ => f64::NAN,
     }
 }
 
@@ -140,26 +103,10 @@ fn timestamp(seconds: f64) -> Result<String> {
     Ok(iso_from_millis(ms.trunc() as i64))
 }
 
-fn fixed(n: f64, digits: usize) -> String {
-    if n.is_infinite() { js_num(n) } else { to_fixed(n, digits) }
-}
-
 /// The first `n` UTF-16 code units, like `String.prototype.slice(0, n)`.
 fn slice_utf16(s: &str, n: usize) -> String {
     let units: Vec<u16> = s.encode_utf16().take(n).collect();
     String::from_utf16_lossy(&units)
-}
-
-fn encode_uri_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 async fn reviews(args: &Args) -> Result<ToolResult> {

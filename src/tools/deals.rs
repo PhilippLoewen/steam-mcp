@@ -6,11 +6,12 @@ use anyhow::{Result, bail};
 use futures::future::join_all;
 use serde_json::{Map, Value, json};
 
+use super::js::{encode_uri_component, fixed, js_str, number, truthy};
 use crate::steam::api::{HTTP, steam_api_request};
 use crate::steam::paths::get_user_config;
 use crate::steam::wishlist::fetch_all_wishlist_pages;
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
-use crate::util::{js_num, js_sort, locale_cmp, to_fixed};
+use crate::util::{js_num, js_sort, locale_cmp};
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
@@ -41,48 +42,9 @@ async fn handle(args: Args) -> ToolResult {
     }
 }
 
-fn truthy(v: Option<&Value>) -> bool {
-    match v {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(_) => true,
-    }
-}
-
 /// JS `a || b`.
 fn js_or<'a>(a: Option<&'a Value>, b: Option<&'a Value>) -> Option<&'a Value> {
     if truthy(a) { a } else { b }
-}
-
-/// `${v}` in a JS template string.
-fn js_str(v: Option<&Value>) -> String {
-    match v {
-        None => "undefined".into(),
-        Some(Value::Null) => "null".into(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Number(n)) => js_num(n.as_f64().unwrap_or(f64::NAN)),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => {
-            a.iter().map(|e| if e.is_null() { String::new() } else { js_str(Some(e)) }).collect::<Vec<_>>().join(",")
-        }
-        Some(Value::Object(_)) => "[object Object]".into(),
-    }
-}
-
-/// JS `Number(v)` for JSON values.
-fn number(v: Option<&Value>) -> f64 {
-    match v {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
-        Some(Value::Null) => 0.0,
-        Some(Value::Bool(b)) => f64::from(u8::from(*b)),
-        Some(Value::String(s)) => {
-            let t = s.trim();
-            if t.is_empty() { 0.0 } else { t.parse().unwrap_or(f64::NAN) }
-        }
-        _ => f64::NAN,
-    }
 }
 
 /// `v.key` in JS: throws on undefined and null, undefined for missing keys.
@@ -101,10 +63,6 @@ fn put(dst: &mut Map<String, Value>, key: &str, v: Option<&Value>) {
     }
 }
 
-fn fixed(n: f64, digits: usize) -> String {
-    if n.is_infinite() { js_num(n) } else { to_fixed(n, digits) }
-}
-
 /// `formatPlaytime`, keeping JS's NaN behaviour.
 fn playtime(minutes: f64) -> String {
     let minutes = if minutes < 0.0 { 0.0 } else { minutes };
@@ -117,18 +75,6 @@ fn playtime(minutes: f64) -> String {
 /// JS `parseFloat` for the "12.34 USD" strings built here.
 fn parse_float(s: &str) -> f64 {
     s.split(' ').next().and_then(|n| n.parse().ok()).unwrap_or(f64::NAN)
-}
-
-fn encode_uri_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 async fn search_store_by_name(name: &str) -> Result<Option<Value>> {

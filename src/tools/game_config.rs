@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use crate::steam::launch_options::{check_launch_options, check_mangohud_setting};
 use crate::steam::paths::steam_may_be_running;
 use crate::steam::userdata::{get_app_launch_options, get_local_config, set_app_launch_options};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, blocking};
 use crate::util::{backup_file, home_dir, io_error, js_num, num, read_text, write_atomic};
 use crate::vdf::{VdfObject, VdfValue, is_array_index, js_entries};
 
@@ -105,7 +105,7 @@ pub fn tool() -> Tool {
             Param::new("mangohud_action", ParamType::Enum(MANGOHUD_ACTIONS)),
             Param::new("settings", ParamType::String),
         ],
-        handler: |args| boxed(handle(args)),
+        handler: |args| blocking(move || handle(args)),
         writes: &[
             Write::Action("set_launch_opts"),
             Write::Param("preset"),
@@ -117,7 +117,7 @@ pub fn tool() -> Tool {
     }
 }
 
-async fn handle(args: Args) -> ToolResult {
+fn handle(args: Args) -> ToolResult {
     let action = args.str("action").unwrap_or_default();
     let result = match action.as_str() {
         "get_launch_opts" => get_launch_opts(&args),

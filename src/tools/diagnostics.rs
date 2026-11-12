@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::steam::paths::get_steam_dir;
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, blocking};
 use crate::util::{io_error, js_num};
 
 pub fn tool() -> Tool {
@@ -17,7 +17,7 @@ pub fn tool() -> Tool {
             Param::new("appid", ParamType::Number),
             Param::new("lines", ParamType::Number),
         ],
-        handler: |args| boxed(async move { ToolResult::or_error(run(&args), "Error parsing log") }),
+        handler: |args| blocking(move || ToolResult::or_error(run(&args), "Error parsing log")),
         writes: &[],
         destructive: false,
         open_world: false,

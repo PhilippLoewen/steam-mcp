@@ -9,6 +9,7 @@ mod game_control;
 mod game_info;
 mod games;
 mod insights;
+mod js;
 mod library;
 mod player;
 mod proton;

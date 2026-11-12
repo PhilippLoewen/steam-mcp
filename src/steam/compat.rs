@@ -71,6 +71,41 @@ pub fn get_installed_proton_versions() -> Result<Vec<ProtonVersion>> {
     Ok(results)
 }
 
+/// The names Steam's CompatToolMapping uses for `version`. A custom tool
+/// lists them in its compatibilitytool.vdf; an official one is named after
+/// its folder (`Proton 9.0` → `proton_9`, `Proton 6.3` → `proton_63`,
+/// `Proton - Experimental` → `proton_experimental`). The folder name itself
+/// is always included.
+pub fn tool_ids(version: &ProtonVersion) -> Vec<String> {
+    let mut ids = vec![version.name.clone()];
+    if let Ok(text) = read_text(&version.path.join("compatibilitytool.vdf"))
+        && let Some(tools) = parse_vdf(&text).navigate(&["compatibilitytools", "compat_tools"])
+    {
+        ids.extend(tools.keys().cloned());
+    }
+    ids.extend(official_tool_id(&version.name));
+    ids
+}
+
+fn official_tool_id(folder: &str) -> Option<String> {
+    let rest = folder.strip_prefix("Proton")?.trim().trim_start_matches("- ").trim();
+    let (major, minor) = rest.split_once('.').unwrap_or((rest, "0"));
+    if !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()) && minor.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(if minor == "0" || minor.is_empty() {
+            format!("proton_{major}")
+        } else {
+            format!("proton_{major}{minor}")
+        });
+    }
+    (!rest.is_empty()).then(|| format!("proton_{}", rest.to_ascii_lowercase().replace([' ', '-'], "_")))
+}
+
+/// Proton runtimes games load implicitly (EasyAntiCheat, BattlEye); never
+/// picked as a game's tool, so never "unused".
+pub fn is_runtime(version: &ProtonVersion) -> bool {
+    version.name.contains("Runtime")
+}
+
 /// The compatibility tool set for `appid`, if any.
 pub fn get_game_proton_version(appid: i64) -> Result<Option<String>> {
     Ok(get_compat_overrides()?.remove(&appid).map(|o| o.dest).filter(|d| !d.is_empty()))
@@ -79,4 +114,39 @@ pub fn get_game_proton_version(appid: i64) -> Result<Option<String>> {
 /// appid -> tool name for every app with an override, from one read of config.vdf.
 pub fn get_all_proton_version_mappings() -> Result<BTreeMap<i64, String>> {
     Ok(get_compat_overrides()?.into_iter().filter(|(_, o)| !o.dest.is_empty()).map(|(id, o)| (id, o.dest)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_official_tools_like_steam() {
+        for (folder, id) in [
+            ("Proton 9.0", "proton_9"),
+            ("Proton 8.0", "proton_8"),
+            ("Proton 6.3", "proton_63"),
+            ("Proton 5.13", "proton_513"),
+            ("Proton 3.7", "proton_37"),
+            ("Proton - Experimental", "proton_experimental"),
+            ("Proton Hotfix", "proton_hotfix"),
+        ] {
+            assert_eq!(official_tool_id(folder).as_deref(), Some(id), "{folder}");
+        }
+        assert_eq!(official_tool_id("GE-Proton9-20"), None);
+    }
+
+    #[test]
+    fn reads_custom_tool_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("GE-Proton9-20");
+        std::fs::create_dir(&tool).unwrap();
+        std::fs::write(
+            tool.join("compatibilitytool.vdf"),
+            "\"compatibilitytools\"\n{\n\t\"compat_tools\"\n\t{\n\t\t\"GE-Proton9-20-custom\"\n\t\t{\n\t\t\t\"display_name\" \"GE\"\n\t\t}\n\t}\n}\n",
+        )
+        .unwrap();
+        let version = ProtonVersion { name: "GE-Proton9-20".into(), path: tool, size: 0 };
+        assert_eq!(tool_ids(&version), ["GE-Proton9-20", "GE-Proton9-20-custom"]);
+    }
 }

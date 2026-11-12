@@ -154,23 +154,23 @@ pub fn get_library_folders() -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// Open a steam:// URL with the platform's handler.
+/// Open a steam:// URL with the platform's handler. On Linux that is the
+/// `steam` command, or `xdg-open` where there is none (Flatpak installs).
 pub fn open_steam_url(url: &str) -> Result<()> {
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/c", "start", "", url]);
-        c
-    } else if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        c.arg(url);
-        c
-    } else {
-        let mut c = Command::new("steam");
-        c.arg(url);
-        c
+    let spawn = |program: &str, args: &[&str]| {
+        Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
     };
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    let mut child = cmd.spawn()?;
+    let spawned = if cfg!(windows) {
+        spawn("cmd", &["/c", "start", "", url])
+    } else if cfg!(target_os = "macos") {
+        spawn("open", &[url])
+    } else {
+        match spawn("steam", &[url]) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => spawn("xdg-open", &[url]),
+            other => other,
+        }
+    };
+    let mut child = spawned.map_err(|e| anyhow!("couldn't start a handler for {url}: {e}"))?;
     // Reap the child in the background so it doesn't linger as a zombie.
     std::thread::spawn(move || {
         let _ = child.wait();

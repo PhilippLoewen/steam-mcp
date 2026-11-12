@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::steam::manifests::read_all_manifests;
 use crate::steam::paths::{open_steam_url, steam_may_be_running};
-use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
+use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, blocking};
 use crate::util::js_num;
 
 pub fn tool() -> Tool {
@@ -16,7 +16,7 @@ pub fn tool() -> Tool {
                 .required(),
             Param::new("appid", ParamType::Number).required(),
         ],
-        handler: |args| boxed(handle(args)),
+        handler: |args| blocking(move || handle(args)),
         writes: &[
             Write::Action("install"),
             Write::Action("uninstall"),
@@ -29,7 +29,7 @@ pub fn tool() -> Tool {
     }
 }
 
-async fn handle(args: Args) -> ToolResult {
+fn handle(args: Args) -> ToolResult {
     let action = args.str("action").unwrap_or_default();
     let appid = args.f64("appid").unwrap_or(0.0);
     ToolResult::or_error(run(&action, appid), &format!("Error in game_control ({action})"))
@@ -39,12 +39,6 @@ async fn handle(args: Args) -> ToolResult {
 /// the manifests propagate; callers that tolerate them decide what to do.
 fn installed_name(appid: f64) -> Result<Option<String>> {
     Ok(read_all_manifests()?.into_iter().find(|m| m.appid as f64 == appid).map(|m| m.name))
-}
-
-/// Open `url`. A failed spawn in Node surfaces asynchronously, after the tool
-/// has already answered, so the result text never reflects it.
-fn open(url: &str) {
-    let _ = open_steam_url(url);
 }
 
 fn not_installed(id: &str, what: &str) -> ToolResult {
@@ -63,7 +57,7 @@ fn run(action: &str, appid: f64) -> Result<ToolResult> {
                 return Ok(ToolResult::text(format!("\"{name}\" (appid: {id}) is already installed.")));
             }
             let url = format!("steam://install/{id}");
-            open(&url);
+            open_steam_url(&url)?;
             [
                 format!("Install requested for appid {id}"),
                 format!("Protocol URL: {url}"),
@@ -78,7 +72,7 @@ fn run(action: &str, appid: f64) -> Result<ToolResult> {
                 Err(_) => format!("appid {id}"),
             };
             let url = format!("steam://uninstall/{id}");
-            open(&url);
+            open_steam_url(&url)?;
             [
                 format!("Uninstall requested for \"{game_name}\" (appid: {id})"),
                 format!("Protocol URL: {url}"),
@@ -93,7 +87,7 @@ fn run(action: &str, appid: f64) -> Result<ToolResult> {
                 Err(_) => format!("appid {id}"),
             };
             let url = format!("steam://rungameid/{id}");
-            open(&url);
+            open_steam_url(&url)?;
             [
                 format!("Launching \"{game_name}\" (appid: {id})"),
                 format!("Protocol URL: {url}"),
@@ -108,7 +102,7 @@ fn run(action: &str, appid: f64) -> Result<ToolResult> {
                 Err(_) => format!("appid {id}"),
             };
             let url = format!("steam://validate/{id}");
-            open(&url);
+            open_steam_url(&url)?;
             [
                 format!("File verification requested for \"{game_name}\" (appid: {id})"),
                 format!("Protocol URL: {url}"),
@@ -122,7 +116,7 @@ fn run(action: &str, appid: f64) -> Result<ToolResult> {
                 return Ok(not_installed(&id, "Cannot move."));
             };
             let url = format!("steam://move/{id}");
-            open(&url);
+            open_steam_url(&url)?;
             [
                 format!("Move requested for \"{game_name}\" (appid: {id})"),
                 format!("Protocol URL: {url}"),
@@ -132,7 +126,7 @@ fn run(action: &str, appid: f64) -> Result<ToolResult> {
         }
         _ => {
             let url = format!("steam://store/{id}");
-            open(&url);
+            open_steam_url(&url)?;
             [
                 format!("Opening store page for appid {id}"),
                 format!("Protocol URL: {url}"),

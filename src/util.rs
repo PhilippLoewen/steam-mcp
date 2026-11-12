@@ -342,17 +342,19 @@ impl<T: Clone> FileCache<T> {
         Self { entries: Mutex::new(HashMap::new()) }
     }
 
+    /// The parsed file, reread when its mtime changed. Reading and parsing
+    /// happen outside the lock, so one slow file doesn't hold up the others.
     pub fn get(&self, path: &Path, parse: impl FnOnce(&str) -> T) -> std::io::Result<T> {
         let mtime = fs::metadata(path)?.modified()?;
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached, data)) = entries.get(path)
+        let entries = || self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, data)) = entries().get(path)
             && *cached == mtime
         {
             return Ok(data.clone());
         }
         let content = fs::read_to_string(path)?;
         let data = parse(&content);
-        entries.insert(path.to_path_buf(), (mtime, data.clone()));
+        entries().insert(path.to_path_buf(), (mtime, data.clone()));
         Ok(data)
     }
 }

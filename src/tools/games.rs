@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
+use super::js::encode_uri_component;
 use crate::steam::api::HTTP;
 use crate::steam::compat::{get_compat_data_size, get_game_proton_version};
 use crate::steam::manifests::{AppManifest, read_all_manifests};
@@ -373,19 +374,6 @@ fn insert_store_details(game: &mut Map<String, Value>, d: &Value) -> Option<()> 
 /// `{ a: v.a, b: v.b }` with undefined properties left out, as JSON.stringify does.
 fn pick(v: &Value, keys: &[&str]) -> Map<String, Value> {
     keys.iter().filter_map(|k| v.get(*k).map(|x| (k.to_string(), x.clone()))).collect()
-}
-
-/// JS `encodeURIComponent`.
-fn encode_uri_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 /// A store search hit's price, as the TS formats `item.price?.final`.

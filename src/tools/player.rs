@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use futures::future::try_join_all;
 use serde_json::{Map, Value, json};
 
+use super::js::{js_str, truthy};
 use crate::steam::api::{has_api_key, persona_state, steam_api_request};
 use crate::steam::paths::{get_user_config, get_user_data_dir};
 use crate::steam::userdata::get_local_config;
@@ -64,31 +65,6 @@ fn get<'a>(v: Option<&'a Value>, key: &str) -> Option<&'a Value> {
 fn put(map: &mut Map<String, Value>, key: &str, value: Option<&Value>) {
     if let Some(v) = value {
         map.insert(key.into(), v.clone());
-    }
-}
-
-fn truthy(v: Option<&Value>) -> bool {
-    match v {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(_) => true,
-    }
-}
-
-/// A value as a JS template string renders it.
-fn js_str(v: Option<&Value>) -> String {
-    match v {
-        None => "undefined".into(),
-        Some(Value::Null) => "null".into(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Number(n)) => js_num(n.as_f64().unwrap_or(f64::NAN)),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => {
-            a.iter().map(|e| if e.is_null() { String::new() } else { js_str(Some(e)) }).collect::<Vec<_>>().join(",")
-        }
-        Some(Value::Object(_)) => "[object Object]".into(),
     }
 }
 
