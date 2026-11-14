@@ -3,11 +3,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 
 use crate::steam::launch_options::{check_launch_options, check_mangohud_setting};
+use crate::steam::millennium::{
+    BridgeLaunchOptions, BridgeOptions, BridgeOutcome, LaunchOptionsRequest, bridge_launch_options,
+};
 use crate::steam::paths::steam_may_be_running;
 use crate::steam::userdata::{get_app_launch_options, get_local_config, set_app_launch_options};
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, blocking};
@@ -88,7 +91,88 @@ const OBJECT_PROTOTYPE_KEYS: &[&str] = &[
     "toLocaleString",
 ];
 
-const STEAM_RUNNING_WARNING: &str = "WARNING: Steam is currently running (or that couldn't be checked)!\nModifying localconfig.vdf while Steam is running will likely result in your changes being overwritten when Steam exits.\nPlease close Steam first, then try again.\n\nLaunch options were NOT modified.";
+/// The refusal for launch options edits while Steam runs and the Millennium
+/// bridge can't take them; `bridge_status` says why it can't.
+fn steam_running_warning(bridge_status: &str) -> String {
+    format!(
+        "WARNING: Steam is currently running (or that couldn't be checked)!\n\
+         Modifying localconfig.vdf while Steam is running will likely result in your changes being overwritten when Steam exits.\n\
+         Please close Steam first, then try again, or install the steam-mcp-bridge Millennium plugin\n\
+         (millennium-plugin/ in the steam-mcp repo) to change launch options while Steam runs.\n\
+         Millennium bridge: {bridge_status}.\n\n\
+         Launch options were NOT modified."
+    )
+}
+
+/// Everything a launch options edit touches outside its own logic, so tests can stand in for Steam.
+trait LaunchEnv {
+    fn steam_running(&self) -> bool;
+    fn bridge(&self, request: &LaunchOptionsRequest) -> Result<BridgeOutcome<BridgeLaunchOptions>>;
+    /// From localconfig.vdf.
+    fn read(&self, appid: i64) -> Result<Option<String>>;
+    /// To localconfig.vdf.
+    fn write(&self, appid: i64, options: &str) -> Result<()>;
+}
+
+/// The real localconfig.vdf and Millennium socket.
+struct LiveEnv;
+
+impl LaunchEnv for LiveEnv {
+    fn steam_running(&self) -> bool {
+        steam_may_be_running()
+    }
+
+    fn bridge(&self, request: &LaunchOptionsRequest) -> Result<BridgeOutcome<BridgeLaunchOptions>> {
+        // game_config's file edits are synchronous, so unlike library it runs on
+        // tokio's blocking pool, where blocking on the runtime is allowed.
+        tokio::runtime::Handle::current().block_on(bridge_launch_options(request, &BridgeOptions::default()))
+    }
+
+    fn read(&self, appid: i64) -> Result<Option<String>> {
+        get_app_launch_options(appid)
+    }
+
+    fn write(&self, appid: i64, options: &str) -> Result<()> {
+        set_app_launch_options(appid, options)
+    }
+}
+
+/// The launch options an edit starts from, and whether the edit has to go
+/// through the bridge. Err holds the refusal when Steam runs and the bridge
+/// can't take the edit.
+fn current_for_edit(env: &impl LaunchEnv, appid: f64) -> Result<Result<(String, bool), String>> {
+    if !env.steam_running() {
+        return Ok(Ok((launch_options_of(env, appid)?.unwrap_or_default(), false)));
+    }
+    match env.bridge(&LaunchOptionsRequest::Get { appid: integral_appid(appid)? })? {
+        BridgeOutcome::Done(current) => Ok(Ok((current.launch_options, true))),
+        BridgeOutcome::Unavailable(why) => Ok(Err(steam_running_warning(&why))),
+    }
+}
+
+/// Write launch options read by [`current_for_edit`]. Through the bridge, the
+/// write is refused if Steam's launch options are no longer `previous`.
+fn write_edit(env: &impl LaunchEnv, appid: i64, options: &str, previous: &str, bridged: bool) -> Result<()> {
+    if !bridged {
+        return env.write(appid, options);
+    }
+    let request =
+        LaunchOptionsRequest::Set { appid, options: options.to_string(), expected: Some(previous.to_string()) };
+    match env.bridge(&request)? {
+        BridgeOutcome::Done(_) => Ok(()),
+        BridgeOutcome::Unavailable(why) => {
+            bail!(
+                "the Millennium bridge stopped answering before the launch options were set ({why}); they were NOT modified"
+            )
+        }
+    }
+}
+
+fn insert_via(out: &mut Map<String, Value>, bridged: bool) {
+    if bridged {
+        out.insert("via".into(), "millennium".into());
+    }
+}
 
 const MANGOHUD_DEFAULTS: &str =
     "fps\ngpu_stats\ngpu_temp\ncpu_stats\ncpu_temp\nram\nvram\nframe_timing\nposition=top-left";
@@ -119,11 +203,12 @@ pub fn tool() -> Tool {
 
 fn handle(args: Args) -> ToolResult {
     let action = args.str("action").unwrap_or_default();
+    let env = LiveEnv;
     let result = match action.as_str() {
-        "get_launch_opts" => get_launch_opts(&args),
-        "set_launch_opts" => set_launch_opts(&args),
-        "presets" => presets(&args),
-        "mangohud" => mangohud(&args),
+        "get_launch_opts" => get_launch_opts(&env, &args),
+        "set_launch_opts" => set_launch_opts(&env, &args),
+        "presets" => presets(&env, &args),
+        "mangohud" => mangohud(&env, &args),
         "steam_settings" => steam_settings(),
         _ => bail_unknown(),
     };
@@ -147,27 +232,52 @@ fn integral_appid(appid: f64) -> Result<i64> {
     Ok(appid as i64)
 }
 
-fn launch_options_of(appid: f64) -> Result<Option<String>> {
+fn launch_options_of(env: &impl LaunchEnv, appid: f64) -> Result<Option<String>> {
     if appid.fract() != 0.0 {
         get_local_config()?;
         return Ok(None);
     }
-    get_app_launch_options(appid as i64)
+    env.read(appid as i64)
 }
 
-fn get_launch_opts(args: &Args) -> Result<ToolResult> {
+fn get_launch_opts(env: &impl LaunchEnv, args: &Args) -> Result<ToolResult> {
     let Some(appid) = truthy_appid(args) else {
         return Ok(ToolResult::error("An appid is required for get_launch_opts."));
     };
-    let options = launch_options_of(appid)?;
-    Ok(ToolResult::json(&json!({
-        "appid": num(appid),
-        "launchOptions": options.clone().unwrap_or_default(),
-        "hasLaunchOptions": options.is_some_and(|o| !o.is_empty()),
-    })))
+    // localconfig.vdf lags behind a running Steam, so ask Steam when the bridge can.
+    let mut stale = None;
+    if env.steam_running() && appid.fract() == 0.0 {
+        match env.bridge(&LaunchOptionsRequest::Get { appid: appid as i64 })? {
+            BridgeOutcome::Done(current) => {
+                return Ok(ToolResult::json(&json!({
+                    "appid": num(appid),
+                    "launchOptions": current.launch_options,
+                    "hasLaunchOptions": !current.launch_options.is_empty(),
+                    "via": "millennium",
+                })));
+            }
+            BridgeOutcome::Unavailable(why) => stale = Some(why),
+        }
+    }
+    let options = launch_options_of(env, appid)?;
+    let mut out = Map::new();
+    out.insert("appid".into(), num(appid));
+    out.insert("launchOptions".into(), options.clone().unwrap_or_default().into());
+    out.insert("hasLaunchOptions".into(), options.is_some_and(|o| !o.is_empty()).into());
+    if let Some(why) = stale {
+        out.insert(
+            "note".into(),
+            format!(
+                "Steam is running, but the Millennium bridge can't be used ({why}); \
+                 these are from localconfig.vdf, which may lag behind Steam."
+            )
+            .into(),
+        );
+    }
+    Ok(ToolResult::json(&Value::Object(out)))
 }
 
-fn set_launch_opts(args: &Args) -> Result<ToolResult> {
+fn set_launch_opts(env: &impl LaunchEnv, args: &Args) -> Result<ToolResult> {
     let _guard = crate::util::file_edit_lock();
     let Some(appid) = truthy_appid(args) else {
         return Ok(ToolResult::error("An appid is required for set_launch_opts."));
@@ -182,22 +292,41 @@ fn set_launch_opts(args: &Args) -> Result<ToolResult> {
              For anything else, set the launch options in Steam's game properties yourself."
         )));
     }
-    if steam_may_be_running() {
-        return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
+    let shown = if options.is_empty() { "(cleared)" } else { options.as_str() };
+    let message = format!("Launch options for appid {} set to: {shown}", js_num(appid));
+
+    if env.steam_running() {
+        let request =
+            LaunchOptionsRequest::Set { appid: integral_appid(appid)?, options: options.clone(), expected: None };
+        return Ok(match env.bridge(&request)? {
+            BridgeOutcome::Unavailable(why) => ToolResult::error(steam_running_warning(&why)),
+            BridgeOutcome::Done(set) => {
+                let mut out = Map::new();
+                out.insert("appid".into(), num(appid));
+                out.insert("launchOptions".into(), options.into());
+                out.insert("success".into(), true.into());
+                out.insert("changed".into(), set.changed.into());
+                out.insert("via".into(), "millennium".into());
+                if set.verified_by_readback {
+                    out.insert("verifiedByReadback".into(), true.into());
+                }
+                out.insert("message".into(), message.into());
+                ToolResult::json(&Value::Object(out))
+            }
+        });
     }
 
-    set_app_launch_options(integral_appid(appid)?, &options)?;
+    env.write(integral_appid(appid)?, &options)?;
 
-    let shown = if options.is_empty() { "(cleared)" } else { options.as_str() };
     Ok(ToolResult::json(&json!({
         "appid": num(appid),
         "launchOptions": options,
         "success": true,
-        "message": format!("Launch options for appid {} set to: {shown}", js_num(appid)),
+        "message": message,
     })))
 }
 
-fn presets(args: &Args) -> Result<ToolResult> {
+fn presets(env: &impl LaunchEnv, args: &Args) -> Result<ToolResult> {
     let _guard = crate::util::file_edit_lock();
     let Some(preset_name) = args.str("preset").filter(|p| !p.is_empty()) else {
         let list: Vec<Value> = PRESETS
@@ -221,26 +350,26 @@ fn presets(args: &Args) -> Result<ToolResult> {
         )));
     }
 
-    if steam_may_be_running() {
-        return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
-    }
-
-    let previous = launch_options_of(appid)?.unwrap_or_default();
+    let (previous, bridged) = match current_for_edit(env, appid)? {
+        Ok(current) => current,
+        Err(refusal) => return Ok(ToolResult::error(refusal)),
+    };
     let Some(preset) = preset else {
         bail!("Cannot read properties of undefined (reading 'includes')");
     };
     let new_options = merge_launch_options(&previous, preset.options);
 
-    set_app_launch_options(integral_appid(appid)?, &new_options)?;
+    write_edit(env, integral_appid(appid)?, &new_options, &previous, bridged)?;
 
-    Ok(ToolResult::json(&json!({
-        "appid": num(appid),
-        "preset": preset_name,
-        "description": preset.description,
-        "previousLaunchOptions": if previous.is_empty() { "(none)" } else { previous.as_str() },
-        "newLaunchOptions": new_options,
-        "success": true,
-    })))
+    let mut out = Map::new();
+    out.insert("appid".into(), num(appid));
+    out.insert("preset".into(), preset_name.into());
+    out.insert("description".into(), preset.description.into());
+    out.insert("previousLaunchOptions".into(), (if previous.is_empty() { "(none)" } else { previous.as_str() }).into());
+    out.insert("newLaunchOptions".into(), new_options.into());
+    out.insert("success".into(), true.into());
+    insert_via(&mut out, bridged);
+    Ok(ToolResult::json(&Value::Object(out)))
 }
 
 /// Merge a preset into existing launch options. Flag presets are appended unless
@@ -355,7 +484,7 @@ fn mangohud_enabled(options: &str) -> bool {
     options.split_whitespace().any(|w| w == "mangohud" || w == "MANGOHUD=1")
 }
 
-fn mangohud(args: &Args) -> Result<ToolResult> {
+fn mangohud(env: &impl LaunchEnv, args: &Args) -> Result<ToolResult> {
     let _guard = crate::util::file_edit_lock();
     let mango_action = args.str("mangohud_action").unwrap_or_else(|| "show".to_string());
     let mango_dir = home_dir().join(".config").join("MangoHud");
@@ -377,18 +506,20 @@ fn mangohud(args: &Args) -> Result<ToolResult> {
                      launch options can't carry unquoted. Set MANGOHUD_CONFIGFILE in Steam yourself."
                 )));
             }
-            if steam_may_be_running() {
-                return Ok(ToolResult::error(format!(
-                    "{STEAM_RUNNING_WARNING}\nA per-game MangoHud config needs the game's launch options \
-                     changed, so the MangoHud config was NOT modified either."
-                )));
-            }
-            let current = get_app_launch_options(id)?.unwrap_or_default();
+            let (current, bridged) = match current_for_edit(env, id as f64)? {
+                Ok(current) => current,
+                Err(refusal) => {
+                    return Ok(ToolResult::error(format!(
+                        "{refusal}\nA per-game MangoHud config needs the game's launch options \
+                         changed, so the MangoHud config was NOT modified either."
+                    )));
+                }
+            };
             let updated = match with_mangohud_config_file(&current, &path) {
                 Ok(updated) => updated,
                 Err(why) => return Ok(ToolResult::error(format!("MangoHud config NOT modified: {why}."))),
             };
-            Some((id, current, updated))
+            Some((id, current, updated, bridged))
         }
         _ => None,
     };
@@ -397,16 +528,23 @@ fn mangohud(args: &Args) -> Result<ToolResult> {
         fs::create_dir_all(dir).map_err(|e| io_error(&e, "mkdir", dir))?;
         backup_file(&config_path).map_err(|e| io_error(&e, "backup", &config_path))?;
         write_atomic(&config_path, content.as_bytes()).map_err(|e| io_error(&e, "open", &config_path))?;
-        if let Some((id, current, updated)) = &launch_update
+        if let Some((id, current, updated, bridged)) = &launch_update
             && updated != current
         {
-            set_app_launch_options(*id, updated)?;
+            write_edit(env, *id, updated, current, *bridged).map_err(|e| {
+                anyhow!(
+                    "{e} (the MangoHud config {} was written, but the game's launch options may not point at it; \
+                     check them before retrying)",
+                    config_path.display()
+                )
+            })?;
         }
         Ok(())
     };
     let launch_json = |out: &mut Map<String, Value>| {
-        if let Some((_, _, updated)) = &launch_update {
+        if let Some((_, _, updated, bridged)) = &launch_update {
             out.insert("launchOptions".into(), updated.clone().into());
+            insert_via(out, *bridged);
             if !mangohud_enabled(updated) {
                 out.insert(
                     "note".into(),
@@ -576,7 +714,168 @@ fn steam_settings() -> Result<ToolResult> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+
     use super::*;
+
+    /// Stands in for Steam: whether it runs, the bridge's answers in order, and localconfig.vdf.
+    #[derive(Default)]
+    struct FakeEnv {
+        running: bool,
+        answers: RefCell<VecDeque<Result<BridgeOutcome<BridgeLaunchOptions>>>>,
+        requests: RefCell<Vec<LaunchOptionsRequest>>,
+        file: RefCell<HashMap<i64, String>>,
+    }
+
+    impl FakeEnv {
+        fn running(answers: Vec<Result<BridgeOutcome<BridgeLaunchOptions>>>) -> Self {
+            Self { running: true, answers: RefCell::new(answers.into()), ..Default::default() }
+        }
+    }
+
+    impl LaunchEnv for FakeEnv {
+        fn steam_running(&self) -> bool {
+            self.running
+        }
+
+        fn bridge(&self, request: &LaunchOptionsRequest) -> Result<BridgeOutcome<BridgeLaunchOptions>> {
+            self.requests.borrow_mut().push(request.clone());
+            self.answers.borrow_mut().pop_front().expect("an answer for every bridge request")
+        }
+
+        fn read(&self, appid: i64) -> Result<Option<String>> {
+            Ok(self.file.borrow().get(&appid).cloned())
+        }
+
+        fn write(&self, appid: i64, options: &str) -> Result<()> {
+            self.file.borrow_mut().insert(appid, options.to_string());
+            Ok(())
+        }
+    }
+
+    fn args(v: Value) -> Args {
+        Args(v.as_object().unwrap().clone())
+    }
+
+    fn done(options: &str, changed: bool) -> Result<BridgeOutcome<BridgeLaunchOptions>> {
+        Ok(BridgeOutcome::Done(BridgeLaunchOptions {
+            launch_options: options.into(),
+            changed,
+            verified_by_readback: false,
+        }))
+    }
+
+    fn unavailable() -> Result<BridgeOutcome<BridgeLaunchOptions>> {
+        Ok(BridgeOutcome::Unavailable("Millennium is not running (no socket at /tmp/x.sock)".into()))
+    }
+
+    fn json_of(result: &ToolResult) -> Value {
+        serde_json::from_str(&result.text).unwrap()
+    }
+
+    #[test]
+    fn set_while_steam_runs_goes_through_the_bridge() {
+        let env = FakeEnv::running(vec![done("-novid", true)]);
+        let result = set_launch_opts(&env, &args(json!({ "appid": 10, "options": "-novid" }))).unwrap();
+        let out = json_of(&result);
+        assert_eq!((out["via"].as_str(), out["changed"].as_bool()), (Some("millennium"), Some(true)));
+        assert_eq!(
+            *env.requests.borrow(),
+            [LaunchOptionsRequest::Set { appid: 10, options: "-novid".into(), expected: None }]
+        );
+        assert!(env.file.borrow().is_empty());
+    }
+
+    #[test]
+    fn set_while_steam_runs_without_the_bridge_is_refused() {
+        let env = FakeEnv::running(vec![unavailable()]);
+        let result = set_launch_opts(&env, &args(json!({ "appid": 10, "options": "-novid" }))).unwrap();
+        assert!(result.is_error);
+        assert!(result.text.contains("Millennium bridge: Millennium is not running"), "{}", result.text);
+        assert!(result.text.ends_with("Launch options were NOT modified."));
+        assert!(env.file.borrow().is_empty());
+    }
+
+    #[test]
+    fn set_checks_options_before_asking_steam() {
+        let env = FakeEnv::running(vec![]);
+        let result = set_launch_opts(&env, &args(json!({ "appid": 10, "options": "rm -rf ~; %command%" }))).unwrap();
+        assert!(result.is_error && result.text.contains("NOT modified"), "{}", result.text);
+        assert!(env.requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn set_while_steam_is_closed_writes_the_file() {
+        let env = FakeEnv::default();
+        let out = json_of(&set_launch_opts(&env, &args(json!({ "appid": 10, "options": "-novid" }))).unwrap());
+        assert!(out.get("via").is_none());
+        assert_eq!(env.file.borrow()[&10], "-novid");
+    }
+
+    #[test]
+    fn preset_while_steam_runs_merges_into_steams_options() {
+        let env = FakeEnv::running(vec![done("-high", false), done("-high -novid", true)]);
+        let result = presets(&env, &args(json!({ "appid": 10, "preset": "skip-intro" }))).unwrap();
+        let out = json_of(&result);
+        assert_eq!(out["newLaunchOptions"], "-high -novid");
+        assert_eq!(out["previousLaunchOptions"], "-high");
+        assert_eq!(out["via"], "millennium");
+        assert_eq!(
+            *env.requests.borrow(),
+            [
+                LaunchOptionsRequest::Get { appid: 10 },
+                LaunchOptionsRequest::Set { appid: 10, options: "-high -novid".into(), expected: Some("-high".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn preset_while_steam_runs_without_the_bridge_is_refused() {
+        let env = FakeEnv::running(vec![unavailable()]);
+        let result = presets(&env, &args(json!({ "appid": 10, "preset": "skip-intro" }))).unwrap();
+        assert!(result.is_error && result.text.contains("NOT modified"), "{}", result.text);
+        assert_eq!(env.requests.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_bridge_error_is_reported_not_retried_on_the_file() {
+        let env = FakeEnv::running(vec![
+            done("-high", false),
+            Err(anyhow!("The launch options of appid 10 changed in Steam since steam-mcp read them")),
+        ]);
+        let err = presets(&env, &args(json!({ "appid": 10, "preset": "skip-intro" }))).unwrap_err();
+        assert!(err.to_string().contains("changed in Steam"), "{err}");
+        assert!(env.file.borrow().is_empty());
+    }
+
+    #[test]
+    fn get_while_steam_runs_asks_steam_and_falls_back_to_the_file() {
+        let env = FakeEnv::running(vec![done("-novid", false)]);
+        env.file.borrow_mut().insert(10, "stale".into());
+        let out = json_of(&get_launch_opts(&env, &args(json!({ "appid": 10 }))).unwrap());
+        assert_eq!((out["launchOptions"].as_str(), out["via"].as_str()), (Some("-novid"), Some("millennium")));
+
+        let env = FakeEnv::running(vec![unavailable()]);
+        env.file.borrow_mut().insert(10, "from-file".into());
+        let out = json_of(&get_launch_opts(&env, &args(json!({ "appid": 10 }))).unwrap());
+        assert_eq!((out["launchOptions"].as_str(), out.get("via")), (Some("from-file"), None));
+        let note = out["note"].as_str().unwrap();
+        assert!(note.contains("Millennium is not running") && note.contains("may lag"), "{note}");
+
+        let env = FakeEnv::default();
+        let out = json_of(&get_launch_opts(&env, &args(json!({ "appid": 10 }))).unwrap());
+        assert!(out.get("note").is_none());
+    }
+
+    #[test]
+    fn a_write_confirmed_by_reading_back_says_so() {
+        let verified =
+            BridgeLaunchOptions { launch_options: "-novid".into(), changed: true, verified_by_readback: true };
+        let env = FakeEnv::running(vec![Ok(BridgeOutcome::Done(verified))]);
+        let out = json_of(&set_launch_opts(&env, &args(json!({ "appid": 10, "options": "-novid" }))).unwrap());
+        assert_eq!(out["verifiedByReadback"], true);
+    }
 
     #[test]
     fn presets_pass_the_launch_option_check() {

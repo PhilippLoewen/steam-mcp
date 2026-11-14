@@ -1,5 +1,5 @@
 import { definePlugin, Field, pluginConfig } from 'millennium';
-import { handle, parseRequest } from './collections';
+import { handle, parseRequest } from './requests';
 
 async function respond(id: string, request: string): Promise<void> {
 	let response;
@@ -15,7 +15,7 @@ async function respond(id: string, request: string): Promise<void> {
 }
 
 // Called by the backend for each request. Answers asynchronously through the
-// plugin config, since collection saves are async.
+// plugin config, since collection saves and app details are async.
 /** @ffi */
 export function handleRequest(id: string, request: string): boolean {
 	void respond(id, request);
@@ -25,5 +25,5 @@ export function handleRequest(id: string, request: string): boolean {
 export default definePlugin(() => ({
 	title: 'Steam MCP Bridge',
 	icon: <span />,
-	content: <Field label="Lets steam-mcp edit library categories while Steam is running." />,
+	content: <Field label="Lets steam-mcp edit library categories and launch options while Steam is running." />,
 }));

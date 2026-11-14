@@ -2,8 +2,8 @@ local logger     = require("logger")
 local millennium = require("millennium")
 
 -- steam-mcp writes a JSON request to config key "request:<id>" over Millennium's
--- socket. Hand it to the frontend, which runs it against Steam's collectionStore
--- and writes the answer to "response:<id>".
+-- socket. Hand it to the frontend, which runs it inside the Steam client and
+-- writes the answer to "response:<id>".
 local REQUEST_PREFIX = "request:"
 
 local function on_config_change(key, value)
