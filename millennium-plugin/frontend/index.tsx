@@ -25,5 +25,5 @@ export function handleRequest(id: string, request: string): boolean {
 export default definePlugin(() => ({
 	title: 'Steam MCP Bridge',
 	icon: <span />,
-	content: <Field label="Lets steam-mcp edit library categories and launch options while Steam is running." />,
+	content: <Field label="Lets steam-mcp edit library categories, launch options and shortcuts while Steam is running." />,
 }));

@@ -7,14 +7,67 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::steam::launch_options::{check_launch_options, check_shortcut_exe, check_start_dir};
+use crate::steam::millennium::{
+    BridgeError, BridgeOptions, BridgeOutcome, BridgeShortcut, ShortcutRequest, bridge_shortcut,
+};
 use crate::steam::paths::steam_may_be_running;
 use crate::steam::shortcuts::{ShortcutEntry, add_shortcuts, read_shortcuts, remove_shortcut};
 use crate::tool::{Args, Param, ParamType, Tool, ToolResult, Write, boxed};
 use crate::util::{format_timestamp, home_dir, js_num};
 
-const STEAM_RUNNING_WARNING: &str = "WARNING: Steam is currently running (or that couldn't be checked)!\n\
-     Steam keeps shortcuts in memory and rewrites shortcuts.vdf, so an edit made now would be lost.\n\
-     Please close Steam first, then try again.\n\nShortcuts were NOT modified.";
+/// The refusal for shortcut edits while Steam runs and the Millennium bridge
+/// can't take them; `bridge_status` says why it can't.
+fn steam_running_warning(bridge_status: &str) -> String {
+    format!(
+        "WARNING: Steam is currently running (or that couldn't be checked)!\n\
+         Steam keeps shortcuts in memory and rewrites shortcuts.vdf, so an edit made now would be lost.\n\
+         Please close Steam first, then try again, or install the steam-mcp-bridge Millennium plugin\n\
+         (millennium-plugin/ in the steam-mcp repo) to edit shortcuts while Steam runs.\n\
+         Millennium bridge: {bridge_status}.\n\n\
+         Shortcuts were NOT modified."
+    )
+}
+
+/// What a shortcut added through the bridge lacks.
+const TAGS_NOT_SET: &str = "Tags aren't set while Steam runs; add the shortcut to a category with \
+                            library category_add instead.";
+
+/// Everything a shortcut edit touches outside its own logic, so tests can stand in for Steam.
+trait ShortcutEnv {
+    fn steam_running(&self) -> bool;
+    async fn bridge(&self, request: &ShortcutRequest) -> Result<BridgeOutcome<BridgeShortcut>>;
+    /// From shortcuts.vdf.
+    fn read(&self) -> Result<Vec<ShortcutEntry>>;
+    /// To shortcuts.vdf.
+    fn add(&self, entries: &[ShortcutEntry]) -> Result<()>;
+    /// From shortcuts.vdf: the first shortcut `matches` accepts.
+    fn remove(&self, matches: &dyn Fn(&ShortcutEntry) -> bool) -> Result<Option<ShortcutEntry>>;
+}
+
+/// The real shortcuts.vdf and Millennium socket.
+struct LiveEnv;
+
+impl ShortcutEnv for LiveEnv {
+    fn steam_running(&self) -> bool {
+        steam_may_be_running()
+    }
+
+    async fn bridge(&self, request: &ShortcutRequest) -> Result<BridgeOutcome<BridgeShortcut>> {
+        bridge_shortcut(request, &BridgeOptions::default()).await
+    }
+
+    fn read(&self) -> Result<Vec<ShortcutEntry>> {
+        read_shortcuts()
+    }
+
+    fn add(&self, entries: &[ShortcutEntry]) -> Result<()> {
+        add_shortcuts(entries)
+    }
+
+    fn remove(&self, matches: &dyn Fn(&ShortcutEntry) -> bool) -> Result<Option<ShortcutEntry>> {
+        remove_shortcut(matches)
+    }
+}
 
 pub fn tool() -> Tool {
     Tool {
@@ -39,11 +92,12 @@ pub fn tool() -> Tool {
 }
 
 async fn handle(args: Args) -> ToolResult {
+    let env = LiveEnv;
     match args.str("action").as_deref() {
         Some("list") => ToolResult::or_error(list(), "Error listing shortcuts"),
-        Some("add") => ToolResult::or_error(add(&args), "Error adding shortcut"),
-        Some("remove") => ToolResult::or_error(remove(&args), "Error removing shortcut"),
-        _ => ToolResult::or_error(import_lutris(&args).await, "Error importing Lutris games"),
+        Some("add") => ToolResult::or_error(add(&env, &args).await, "Error adding shortcut"),
+        Some("remove") => ToolResult::or_error(remove(&env, &args).await, "Error removing shortcut"),
+        _ => ToolResult::or_error(import_lutris(&env, &args).await, "Error importing Lutris games"),
     }
 }
 
@@ -127,11 +181,18 @@ fn list() -> Result<ToolResult> {
     Ok(ToolResult::json(&json!({ "count": results.len(), "shortcuts": results })))
 }
 
-fn add(args: &Args) -> Result<ToolResult> {
-    let _guard = crate::util::file_edit_lock();
-    if steam_may_be_running() {
-        return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
-    }
+fn bridged_json(s: &BridgeShortcut) -> Value {
+    json!({
+        "appid": s.appid,
+        "name": s.name,
+        "exe": s.exe,
+        "startDir": s.start_dir,
+        "launchOptions": s.launch_options,
+        "tags": [],
+    })
+}
+
+async fn add(env: &impl ShortcutEnv, args: &Args) -> Result<ToolResult> {
     let name = args.str("name").filter(|s| !s.is_empty());
     let exe = args.str("exe").filter(|s| !s.is_empty());
     let (Some(name), Some(exe)) = (name, exe) else {
@@ -153,53 +214,115 @@ fn add(args: &Args) -> Result<ToolResult> {
         }
     };
 
+    let file_appid = generate_shortcut_id(&exe, &name);
     // Quoted, as Steam writes these fields itself: Steam puts them into the
     // command line it may run through a shell, and the checks above leave
     // nothing a shell would interpret inside double quotes.
-    let entry = ShortcutEntry {
-        appid: generate_shortcut_id(&exe, &name),
-        start_dir: format!("\"{start_dir}\""),
-        app_name: name,
-        exe: format!("\"{exe}\""),
-        launch_options,
-        last_play_time: 0,
-        tags: args.strings("tags").unwrap_or_default(),
-    };
-    add_shortcuts(std::slice::from_ref(&entry))?;
+    let (exe, start_dir) = (format!("\"{exe}\""), format!("\"{start_dir}\""));
+    let tags = args.strings("tags").unwrap_or_default();
 
-    Ok(ToolResult::json(&json!({
-        "message": "Shortcut added successfully",
-        "shortcut": shortcut_json(&entry),
-    })))
+    if !env.steam_running() {
+        let _guard = crate::util::file_edit_lock();
+        // Checked again under the lock: Steam may have started while another edit held it.
+        if !env.steam_running() {
+            let entry = ShortcutEntry {
+                appid: file_appid,
+                start_dir,
+                app_name: name,
+                exe,
+                launch_options,
+                last_play_time: 0,
+                tags,
+            };
+            env.add(std::slice::from_ref(&entry))?;
+            return Ok(ToolResult::json(&json!({
+                "message": "Shortcut added successfully",
+                "shortcut": shortcut_json(&entry),
+            })));
+        }
+    }
+
+    let request = ShortcutRequest::Add { name, exe, start_dir, launch_options };
+    let added = env.bridge(&request).await.map_err(|e| {
+        // Unlike launch options, a new shortcut can't be read back without its appid.
+        if BridgeError::outcome_unknown(&e) {
+            anyhow!("{e} Check the library before adding it again, or it may be added twice.")
+        } else {
+            e
+        }
+    })?;
+    Ok(match added {
+        BridgeOutcome::Unavailable(why) => ToolResult::error(steam_running_warning(&why)),
+        BridgeOutcome::Done(added) => {
+            let mut out = json!({
+                "message": "Shortcut added successfully",
+                "shortcut": bridged_json(&added),
+                "via": "millennium",
+            });
+            if !tags.is_empty() {
+                out["note"] = TAGS_NOT_SET.into();
+            }
+            ToolResult::json(&out)
+        }
+    })
 }
 
-fn remove(args: &Args) -> Result<ToolResult> {
-    let _guard = crate::util::file_edit_lock();
-    if steam_may_be_running() {
-        return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
-    }
+async fn remove(env: &impl ShortcutEnv, args: &Args) -> Result<ToolResult> {
     let appid = args.f64("appid");
     let name = args.str("name");
     if appid.is_none() && name.is_none() {
         return Ok(ToolResult::error("Error: Either appid or name must be provided."));
     }
-
-    let removed = remove_shortcut(|s| match appid {
-        Some(id) => s.appid as f64 == id,
-        None => Some(&s.app_name) == name.as_ref(),
-    })?;
-    let Some(removed) = removed else {
+    let not_found = || {
         let target = match appid {
             Some(id) => format!("appid {}", js_num(id)),
-            None => format!("name \"{}\"", name.unwrap_or_default()),
+            None => format!("name \"{}\"", name.clone().unwrap_or_default()),
         };
-        return Ok(ToolResult::error(format!("Shortcut not found matching {target}.")));
+        Ok(ToolResult::error(format!("Shortcut not found matching {target}.")))
     };
 
-    Ok(ToolResult::json(&json!({
-        "message": "Shortcut removed successfully",
-        "removed": shortcut_json(&removed),
-    })))
+    if !env.steam_running() {
+        let _guard = crate::util::file_edit_lock();
+        // Checked again under the lock: Steam may have started while another edit held it.
+        if !env.steam_running() {
+            let removed = env.remove(&|s| match appid {
+                Some(id) => s.appid as f64 == id,
+                None => Some(&s.app_name) == name.as_ref(),
+            })?;
+            let Some(removed) = removed else {
+                return not_found();
+            };
+            return Ok(ToolResult::json(&json!({
+                "message": "Shortcut removed successfully",
+                "removed": shortcut_json(&removed),
+            })));
+        }
+    }
+
+    // By name, the appid comes from shortcuts.vdf; one Steam hasn't saved
+    // there yet can only be removed by appid.
+    let target = match appid {
+        Some(id) if id.fract() == 0.0 && id > 0.0 => id as i64,
+        Some(_) => return not_found(),
+        None => match env.read()?.into_iter().find(|s| Some(&s.app_name) == name.as_ref()) {
+            Some(s) if s.appid > 0 => s.appid,
+            Some(s) => {
+                return Ok(ToolResult::error(format!(
+                    "Shortcut \"{}\" has no appid in shortcuts.vdf, so it can only be removed while Steam is closed.",
+                    s.app_name
+                )));
+            }
+            None => return not_found(),
+        },
+    };
+    Ok(match env.bridge(&ShortcutRequest::Remove { appid: target }).await? {
+        BridgeOutcome::Unavailable(why) => ToolResult::error(steam_running_warning(&why)),
+        BridgeOutcome::Done(removed) => ToolResult::json(&json!({
+            "message": "Shortcut removed successfully",
+            "removed": bridged_json(&removed),
+            "via": "millennium",
+        })),
+    })
 }
 
 /// `execSync` of a shell command with a timeout; None on spawn failure, timeout or non-zero exit.
@@ -217,13 +340,17 @@ async fn exec(command: &str, timeout: Duration) -> Option<String> {
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-async fn import_lutris(args: &Args) -> Result<ToolResult> {
+async fn import_lutris(env: &impl ShortcutEnv, args: &Args) -> Result<ToolResult> {
     let Some(raw_json) = exec("lutris --list-games --json", Duration::from_millis(15_000)).await else {
         return Ok(ToolResult::error(
             "Error: Could not run \"lutris --list-games --json\". Is Lutris installed and in PATH?",
         ));
     };
-    let Ok(parsed) = serde_json::from_str::<Value>(&raw_json) else {
+    import_lutris_games(env, args, &raw_json).await
+}
+
+async fn import_lutris_games(env: &impl ShortcutEnv, args: &Args, raw_json: &str) -> Result<ToolResult> {
+    let Ok(parsed) = serde_json::from_str::<Value>(raw_json) else {
         return Ok(ToolResult::error("Error: Failed to parse Lutris JSON output."));
     };
 
@@ -242,44 +369,71 @@ async fn import_lutris(args: &Args) -> Result<ToolResult> {
         return Ok(ToolResult::text("No matching Lutris games found."));
     }
 
-    let _guard = crate::util::file_edit_lock();
-    if steam_may_be_running() {
-        return Ok(ToolResult::error(STEAM_RUNNING_WARNING));
-    }
-    let existing_names: HashSet<String> = read_shortcuts()?.iter().map(|s| s.app_name.to_lowercase()).collect();
+    let mut bridged = env.steam_running();
     let mut new_shortcuts = Vec::new();
     let mut imported: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut invalid: Vec<String> = Vec::new();
 
-    for game in &lutris_games {
-        let name = game
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("Cannot read properties of undefined (reading 'toLowerCase')"))?;
-        // The id goes into launch options, so only a plain number is used.
-        let Some(id) = game.get("id").and_then(Value::as_u64) else {
-            invalid.push(name.to_string());
-            continue;
-        };
-        if existing_names.contains(&name.to_lowercase()) {
-            skipped.push(name.to_string());
-            continue;
+    // The file lock spans reading the existing names and writing, and ends
+    // before the bridge is awaited (a held std guard would make this future !Send).
+    {
+        let _guard = (!bridged).then(crate::util::file_edit_lock);
+        // Checked again under the lock: Steam may have started while another edit held it.
+        bridged = bridged || env.steam_running();
+        let existing_names: HashSet<String> = env.read()?.iter().map(|s| s.app_name.to_lowercase()).collect();
+        for game in &lutris_games {
+            let name = game
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Cannot read properties of undefined (reading 'toLowerCase')"))?;
+            // The id goes into launch options, so only a plain number is used.
+            let Some(id) = game.get("id").and_then(Value::as_u64) else {
+                invalid.push(name.to_string());
+                continue;
+            };
+            if existing_names.contains(&name.to_lowercase()) {
+                skipped.push(name.to_string());
+                continue;
+            }
+            new_shortcuts.push(ShortcutEntry {
+                appid: generate_shortcut_id("lutris", name),
+                app_name: name.to_string(),
+                exe: "lutris".into(),
+                start_dir: home_dir().to_string_lossy().into_owned(),
+                launch_options: format!("lutris:rungameid/{id}"),
+                last_play_time: 0,
+                tags: vec!["Lutris".into()],
+            });
         }
-        new_shortcuts.push(ShortcutEntry {
-            appid: generate_shortcut_id("lutris", name),
-            app_name: name.to_string(),
-            exe: "lutris".into(),
-            start_dir: home_dir().to_string_lossy().into_owned(),
-            launch_options: format!("lutris:rungameid/{id}"),
-            last_play_time: 0,
-            tags: vec!["Lutris".into()],
-        });
-        imported.push(name.to_string());
+        if !bridged && !new_shortcuts.is_empty() {
+            env.add(&new_shortcuts)?;
+            imported = new_shortcuts.iter().map(|s| s.app_name.clone()).collect();
+        }
     }
 
-    if !new_shortcuts.is_empty() {
-        add_shortcuts(&new_shortcuts)?;
+    let mut failed = Vec::new();
+    if bridged {
+        // One at a time: a game that fails doesn't stop the rest.
+        for entry in &new_shortcuts {
+            let request = ShortcutRequest::Add {
+                name: entry.app_name.clone(),
+                exe: entry.exe.clone(),
+                start_dir: entry.start_dir.clone(),
+                launch_options: entry.launch_options.clone(),
+            };
+            match env.bridge(&request).await {
+                Ok(BridgeOutcome::Done(_)) => imported.push(entry.app_name.clone()),
+                // Before anything was added, nothing changed: refuse like the other edits.
+                Ok(BridgeOutcome::Unavailable(why)) if imported.is_empty() && failed.is_empty() => {
+                    return Ok(ToolResult::error(steam_running_warning(&why)));
+                }
+                Ok(BridgeOutcome::Unavailable(why)) => {
+                    failed.push(json!({ "name": entry.app_name, "error": format!("Millennium bridge: {why}") }));
+                }
+                Err(e) => failed.push(json!({ "name": entry.app_name, "error": e.to_string() })),
+            }
+        }
     }
 
     let mut message =
@@ -287,16 +441,323 @@ async fn import_lutris(args: &Args) -> Result<ToolResult> {
     if !invalid.is_empty() {
         message.push_str(&format!(" {} game(s) had no numeric Lutris id and were left out.", invalid.len()));
     }
+    if !failed.is_empty() {
+        message.push_str(&format!(
+            " {} game(s) failed; some may still have been added (see each error), so check the library before retrying.",
+            failed.len()
+        ));
+    }
     let mut out = json!({ "message": message, "imported": imported, "skipped": skipped });
     if !invalid.is_empty() {
         out["invalidId"] = json!(invalid);
+    }
+    if bridged {
+        out["via"] = "millennium".into();
+        if !failed.is_empty() {
+            out["failed"] = json!(failed);
+        }
+        if !imported.is_empty() {
+            out["note"] = "The Lutris tag isn't set while Steam runs; add the shortcuts to a category with \
+                           library category_add instead."
+                .into();
+        }
     }
     Ok(ToolResult::json(&out))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
     use super::*;
+
+    /// Stands in for Steam: whether it runs, the bridge's answers in order, and shortcuts.vdf.
+    #[derive(Default)]
+    struct FakeEnv {
+        running: bool,
+        answers: RefCell<VecDeque<Result<BridgeOutcome<BridgeShortcut>>>>,
+        requests: RefCell<Vec<ShortcutRequest>>,
+        file: RefCell<Vec<ShortcutEntry>>,
+    }
+
+    impl FakeEnv {
+        fn running(answers: Vec<Result<BridgeOutcome<BridgeShortcut>>>) -> Self {
+            Self { running: true, answers: RefCell::new(answers.into()), ..Default::default() }
+        }
+    }
+
+    impl ShortcutEnv for FakeEnv {
+        fn steam_running(&self) -> bool {
+            self.running
+        }
+
+        async fn bridge(&self, request: &ShortcutRequest) -> Result<BridgeOutcome<BridgeShortcut>> {
+            self.requests.borrow_mut().push(request.clone());
+            self.answers.borrow_mut().pop_front().expect("an answer for every bridge request")
+        }
+
+        fn read(&self) -> Result<Vec<ShortcutEntry>> {
+            Ok(self.file.borrow().clone())
+        }
+
+        fn add(&self, entries: &[ShortcutEntry]) -> Result<()> {
+            self.file.borrow_mut().extend_from_slice(entries);
+            Ok(())
+        }
+
+        fn remove(&self, matches: &dyn Fn(&ShortcutEntry) -> bool) -> Result<Option<ShortcutEntry>> {
+            let mut file = self.file.borrow_mut();
+            Ok(file.iter().position(matches).map(|i| file.remove(i)))
+        }
+    }
+
+    fn args(v: Value) -> Args {
+        Args(v.as_object().unwrap().clone())
+    }
+
+    fn json_of(result: &ToolResult) -> Value {
+        serde_json::from_str(&result.text).unwrap_or_else(|_| panic!("not JSON: {}", result.text))
+    }
+
+    fn steam_shortcut(appid: i64, name: &str) -> Result<BridgeOutcome<BridgeShortcut>> {
+        Ok(BridgeOutcome::Done(BridgeShortcut {
+            appid,
+            name: name.into(),
+            exe: "lutris".into(),
+            start_dir: String::new(),
+            launch_options: String::new(),
+        }))
+    }
+
+    fn unavailable() -> Result<BridgeOutcome<BridgeShortcut>> {
+        Ok(BridgeOutcome::Unavailable("Millennium is not running (no socket at /tmp/x.sock)".into()))
+    }
+
+    fn entry(appid: i64, name: &str) -> ShortcutEntry {
+        ShortcutEntry {
+            appid,
+            app_name: name.into(),
+            exe: "\"/opt/x\"".into(),
+            start_dir: "\"/opt\"".into(),
+            launch_options: String::new(),
+            last_play_time: 0,
+            tags: vec![],
+        }
+    }
+
+    /// An executable the shortcut checks accept, under target/ (they look at every parent folder).
+    #[cfg(unix)]
+    fn game_exe() -> Option<(tempfile::TempDir, String)> {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let game = dir.path().join("game");
+        std::fs::write(&game, "").unwrap();
+        std::fs::set_permissions(&game, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let checked = check_shortcut_exe(game.to_str().unwrap()).ok()?;
+        Some((dir, checked))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn add_while_steam_runs_goes_through_the_bridge() {
+        // A checkout in a folder anyone can write to can't hold an acceptable program.
+        let Some((_dir, exe)) = game_exe() else { return };
+        let start_dir = dirname(&exe);
+        let env = FakeEnv::running(vec![steam_shortcut(3000000002, "Game")]);
+        let result = add(&env, &args(json!({ "name": "Game", "exe": exe, "tags": ["RPG"] }))).await.unwrap();
+        let out = json_of(&result);
+        assert_eq!((out["via"].as_str(), out["shortcut"]["appid"].as_i64()), (Some("millennium"), Some(3000000002)));
+        assert!(out["note"].as_str().unwrap().contains("category_add"));
+        assert_eq!(
+            *env.requests.borrow(),
+            [ShortcutRequest::Add {
+                name: "Game".into(),
+                exe: format!("\"{exe}\""),
+                start_dir: format!("\"{start_dir}\""),
+                launch_options: String::new(),
+            }]
+        );
+        assert!(env.file.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn add_while_steam_runs_without_the_bridge_is_refused() {
+        let Some((_dir, exe)) = game_exe() else { return };
+        let env = FakeEnv::running(vec![unavailable()]);
+        let result = add(&env, &args(json!({ "name": "Game", "exe": exe }))).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.text.contains("Millennium bridge: Millennium is not running"), "{}", result.text);
+        assert!(result.text.ends_with("Shortcuts were NOT modified."));
+        assert!(env.file.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn add_while_steam_is_closed_writes_the_file() {
+        let Some((_dir, exe)) = game_exe() else { return };
+        let env = FakeEnv::default();
+        let out = json_of(&add(&env, &args(json!({ "name": "Game", "exe": exe }))).await.unwrap());
+        assert!(out.get("via").is_none());
+        assert_eq!(env.file.borrow()[0].exe, format!("\"{exe}\""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_file_route_keeps_the_appid_of_the_unquoted_path() {
+        let Some((_dir, exe)) = game_exe() else { return };
+        let env = FakeEnv::default();
+        add(&env, &args(json!({ "name": "Game", "exe": exe }))).await.unwrap();
+        assert_eq!(env.file.borrow()[0].appid, generate_shortcut_id(&exe, "Game"));
+    }
+
+    /// Steam closed at the first check, running by the second, under the lock.
+    struct StartsDuringTheWait {
+        inner: FakeEnv,
+        checks: std::cell::Cell<u32>,
+    }
+
+    impl ShortcutEnv for StartsDuringTheWait {
+        fn steam_running(&self) -> bool {
+            self.checks.set(self.checks.get() + 1);
+            self.checks.get() > 1
+        }
+        async fn bridge(&self, request: &ShortcutRequest) -> Result<BridgeOutcome<BridgeShortcut>> {
+            self.inner.bridge(request).await
+        }
+        fn read(&self) -> Result<Vec<ShortcutEntry>> {
+            self.inner.read()
+        }
+        fn add(&self, entries: &[ShortcutEntry]) -> Result<()> {
+            self.inner.add(entries)
+        }
+        fn remove(&self, matches: &dyn Fn(&ShortcutEntry) -> bool) -> Result<Option<ShortcutEntry>> {
+            self.inner.remove(matches)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_steam_that_starts_while_waiting_for_the_lock_gets_the_bridge() {
+        let env = StartsDuringTheWait {
+            inner: FakeEnv::running(vec![steam_shortcut(3000000001, "Old")]),
+            checks: Default::default(),
+        };
+        env.inner.file.borrow_mut().push(entry(3000000001, "Old"));
+        let out = json_of(&remove(&env, &args(json!({ "name": "Old" }))).await.unwrap());
+        assert_eq!(out["via"], "millennium");
+        assert_eq!(env.inner.file.borrow().len(), 1, "the file was left alone");
+
+        let env = StartsDuringTheWait { inner: FakeEnv::running(vec![unavailable()]), checks: Default::default() };
+        let result = import_lutris_games(&env, &args(json!({})), LUTRIS).await.unwrap();
+        assert!(result.is_error && result.text.contains("NOT modified"), "{}", result.text);
+        assert!(env.inner.file.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_checks_the_program_before_asking_steam() {
+        let env = FakeEnv::running(vec![]);
+        let result = add(&env, &args(json!({ "name": "Shell", "exe": "/bin/sh" }))).await.unwrap();
+        assert!(result.is_error && result.text.contains("NOT added"), "{}", result.text);
+        assert!(env.requests.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_while_steam_runs_finds_the_appid_by_name() {
+        let env = FakeEnv::running(vec![steam_shortcut(3000000001, "Old")]);
+        env.file.borrow_mut().push(entry(3000000001, "Old"));
+        let out = json_of(&remove(&env, &args(json!({ "name": "Old" }))).await.unwrap());
+        assert_eq!((out["via"].as_str(), out["removed"]["name"].as_str()), (Some("millennium"), Some("Old")));
+        assert_eq!(*env.requests.borrow(), [ShortcutRequest::Remove { appid: 3000000001 }]);
+        assert_eq!(env.file.borrow().len(), 1, "the file is Steam's to rewrite");
+    }
+
+    #[tokio::test]
+    async fn remove_while_steam_runs_by_name_needs_an_appid_in_the_file() {
+        let env = FakeEnv::running(vec![]);
+        env.file.borrow_mut().push(entry(0, "Ancient"));
+        let result = remove(&env, &args(json!({ "name": "Ancient" }))).await.unwrap();
+        assert!(result.is_error && result.text.contains("no appid"), "{}", result.text);
+        assert!(env.requests.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_uncertain_add_warns_about_adding_twice() {
+        let Some((_dir, exe)) = game_exe() else { return };
+        let uncertain = BridgeError {
+            message: "Lost the connection to Millennium (x); the edit may or may not have been applied.".into(),
+            timeout: false,
+            outcome_unknown: true,
+        };
+        let env = FakeEnv::running(vec![Err(uncertain.into())]);
+        let err = add(&env, &args(json!({ "name": "Game", "exe": exe }))).await.unwrap_err();
+        assert!(err.to_string().contains("added twice"), "{err}");
+
+        let env = FakeEnv::running(vec![Err(anyhow!("Steam knows no non-Steam shortcut"))]);
+        let err = add(&env, &args(json!({ "name": "Game", "exe": exe }))).await.unwrap_err();
+        assert!(!err.to_string().contains("added twice"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn remove_while_steam_runs_passes_an_appid_through() {
+        let env = FakeEnv::running(vec![steam_shortcut(3000000009, "New")]);
+        remove(&env, &args(json!({ "appid": 3000000009u64 }))).await.unwrap();
+        assert_eq!(*env.requests.borrow(), [ShortcutRequest::Remove { appid: 3000000009 }]);
+    }
+
+    #[tokio::test]
+    async fn remove_while_steam_runs_of_an_unknown_name_asks_nothing() {
+        let env = FakeEnv::running(vec![]);
+        let result = remove(&env, &args(json!({ "name": "Nope" }))).await.unwrap();
+        assert!(result.is_error && result.text.contains("not found"), "{}", result.text);
+        assert!(env.requests.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_while_steam_runs_without_the_bridge_is_refused() {
+        let env = FakeEnv::running(vec![unavailable()]);
+        let result = remove(&env, &args(json!({ "appid": 3000000009u64 }))).await.unwrap();
+        assert!(result.is_error && result.text.contains("NOT modified"), "{}", result.text);
+    }
+
+    const LUTRIS: &str = r#"[{"id": 1, "name": "One"}, {"id": 2, "name": "Two"}, {"id": 3, "name": "Kept"}]"#;
+
+    #[tokio::test]
+    async fn import_while_steam_runs_adds_each_game_and_reports_failures() {
+        let env = FakeEnv::running(vec![steam_shortcut(3000000001, "One"), Err(anyhow!("Steam refused"))]);
+        env.file.borrow_mut().push(entry(5, "kept"));
+        let out = json_of(&import_lutris_games(&env, &args(json!({})), LUTRIS).await.unwrap());
+        assert_eq!(out["imported"], json!(["One"]));
+        assert_eq!(out["skipped"], json!(["Kept"]));
+        assert_eq!(out["failed"], json!([{ "name": "Two", "error": "Steam refused" }]));
+        assert_eq!(out["via"], "millennium");
+        assert!(out["message"].as_str().unwrap().contains("1 game(s) failed"));
+        let requests = env.requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(&requests[1], ShortcutRequest::Add { name, exe, launch_options, .. }
+            if name == "Two" && exe == "lutris" && launch_options == "lutris:rungameid/2"));
+    }
+
+    #[tokio::test]
+    async fn import_while_steam_runs_without_the_bridge_is_refused() {
+        let env = FakeEnv::running(vec![unavailable()]);
+        let result = import_lutris_games(&env, &args(json!({})), LUTRIS).await.unwrap();
+        assert!(result.is_error && result.text.contains("NOT modified"), "{}", result.text);
+        assert_eq!(env.requests.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_while_steam_is_closed_writes_the_file() {
+        let env = FakeEnv::default();
+        let out = json_of(&import_lutris_games(&env, &args(json!({})), LUTRIS).await.unwrap());
+        assert_eq!(out["imported"], json!(["One", "Two", "Kept"]));
+        assert!(out.get("via").is_none());
+        assert_eq!(env.file.borrow().len(), 3);
+    }
 
     #[test]
     fn shortcut_id_matches_js() {

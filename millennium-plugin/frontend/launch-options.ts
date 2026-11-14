@@ -4,15 +4,15 @@
  * it, so a write made here sticks while Steam runs.
  */
 
-interface AppDetails {
-	strLaunchOptions?: string;
-	strShortcutExe?: string;
-}
-
-interface Apps {
-	RegisterForAppDetails(appid: number, callback: (details: AppDetails) => void): { unregister(): void };
-	SetAppLaunchOptions(appid: number, options: string): void;
-}
+import {
+	type AppDetails,
+	DETAILS_TIMEOUT_MS,
+	requireAppid,
+	requireString,
+	serialize,
+	steamApps,
+	waitForDetails,
+} from './steam-apps';
 
 export type Request =
 	| { action: 'get_launch_options'; appid: number }
@@ -26,61 +26,11 @@ export interface LaunchOptionsResult {
 
 export const ACTIONS: readonly string[] = ['get_launch_options', 'set_launch_options'];
 
-/** Longest launch options a request may carry. */
-const MAX_OPTIONS_LENGTH = 4096;
-/** How long Steam gets to send an app's details, and to confirm a write. */
-const DETAILS_TIMEOUT_MS = 2000;
-
-function apps(): Apps {
-	const client = (window as unknown as { SteamClient?: { Apps?: Partial<Apps> } }).SteamClient?.Apps;
-	for (const name of ['RegisterForAppDetails', 'SetAppLaunchOptions'] as const) {
-		if (typeof client?.[name] !== 'function') {
-			throw new Error(`This Steam client has no SteamClient.Apps.${name}; close Steam and edit again`);
-		}
-	}
-	return client as Apps;
-}
-
-/**
- * Wait for the app's details to satisfy `done`, for at most DETAILS_TIMEOUT_MS.
- * Resolves with the last details Steam sent (null when it sent none) and
- * whether they satisfied `done`.
- */
-function waitForDetails(
-	appid: number,
-	done: (details: AppDetails) => boolean,
-): Promise<{ details: AppDetails | null; matched: boolean }> {
-	return new Promise((resolve, reject) => {
-		let last: AppDetails | null = null;
-		let settled = false;
-		let registration: { unregister(): void } | undefined;
-		const finish = (matched: boolean) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			registration?.unregister();
-			resolve({ details: last, matched });
-		};
-		const timer = setTimeout(() => finish(false), DETAILS_TIMEOUT_MS);
-		try {
-			registration = apps().RegisterForAppDetails(appid, (details) => {
-				// Steam answers an appid it doesn't know with an empty object.
-				last = details && Object.keys(details).length > 0 ? details : null;
-				if (last && done(last)) finish(true);
-			});
-		} catch (error) {
-			settled = true;
-			clearTimeout(timer);
-			reject(error);
-			return;
-		}
-		// The callback may have fired during registration, before it could be unregistered.
-		if (settled) registration?.unregister();
-	});
-}
+const apps = () => steamApps('RegisterForAppDetails', 'SetAppLaunchOptions');
 
 /** The app's details, refusing apps Steam doesn't know and non-Steam shortcuts. */
 async function steamApp(appid: number): Promise<AppDetails> {
+	apps();
 	const { details } = await waitForDetails(appid, () => true);
 	if (!details) throw new Error(`Steam knows no app with appid ${appid} in this library`);
 	if (details.strShortcutExe) {
@@ -94,21 +44,8 @@ async function getLaunchOptions(appid: number): Promise<LaunchOptionsResult> {
 	return { appid, launchOptions: details.strLaunchOptions ?? '', changed: false };
 }
 
-/** The write in progress; the next one waits for it. */
-let writes: Promise<unknown> = Promise.resolve();
-
-/**
- * Writes run one at a time, so two requests can't both pass the same
- * `expected` check. An edit made in Steam's own dialog at the same moment can
- * still slip in between the check and the write.
- */
-function setLaunchOptions(appid: number, options: string, expected?: string): Promise<LaunchOptionsResult> {
-	const write = writes.then(() => writeLaunchOptions(appid, options, expected));
-	writes = write.catch(() => undefined);
-	return write;
-}
-
-async function writeLaunchOptions(appid: number, options: string, expected?: string): Promise<LaunchOptionsResult> {
+/** One write at a time (see serialize), so two requests can't both pass the same `expected` check. */
+async function setLaunchOptions(appid: number, options: string, expected?: string): Promise<LaunchOptionsResult> {
 	const current = (await steamApp(appid)).strLaunchOptions ?? '';
 	if (expected !== undefined && current !== expected) {
 		throw new Error(
@@ -130,20 +67,6 @@ async function writeLaunchOptions(appid: number, options: string, expected?: str
 	return { appid, launchOptions: options, changed: true };
 }
 
-function requireAppid(value: unknown): number {
-	if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > 0xffffffff) {
-		throw new Error('"appid" must be a positive whole number of at most 32 bits');
-	}
-	return value as number;
-}
-
-function requireOptions(value: unknown, field: string): string {
-	if (typeof value !== 'string' || value.length > MAX_OPTIONS_LENGTH) {
-		throw new Error(`"${field}" must be a string of at most ${MAX_OPTIONS_LENGTH} characters`);
-	}
-	return value;
-}
-
 /**
  * Check a launch options request. Only its shape: which launch options are
  * acceptable is steam-mcp's check, and a program that can reach Millennium's
@@ -153,13 +76,13 @@ export function parse(fields: Record<string, unknown>): Request {
 	const appid = requireAppid(fields.appid);
 	if (fields.action === 'get_launch_options') return { action: 'get_launch_options', appid };
 	if (fields.action !== 'set_launch_options') throw new Error(`Unknown action ${JSON.stringify(fields.action)}`);
-	const request: Request = { action: 'set_launch_options', appid, options: requireOptions(fields.options, 'options') };
-	if (fields.expected !== undefined) request.expected = requireOptions(fields.expected, 'expected');
+	const request: Request = { action: 'set_launch_options', appid, options: requireString(fields.options, 'options') };
+	if (fields.expected !== undefined) request.expected = requireString(fields.expected, 'expected');
 	return request;
 }
 
 export function handle(request: Request): Promise<LaunchOptionsResult> {
 	return request.action === 'get_launch_options'
 		? getLaunchOptions(request.appid)
-		: setLaunchOptions(request.appid, request.options, request.expected);
+		: serialize(() => setLaunchOptions(request.appid, request.options, request.expected));
 }
