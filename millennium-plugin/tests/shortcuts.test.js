@@ -52,7 +52,62 @@ beforeEach(() => {
 		SetShortcutLaunchOptions: set('strShortcutLaunchOptions'),
 	};
 	window.SteamClient = { Apps: apps };
-	window.appStore = { GetAppOverviewByAppID: (appid) => (known.has(appid) ? { appid } : null) };
+	window.appStore = {
+		GetAppOverviewByAppID: (appid) => (known.has(appid) ? { appid } : null),
+		get allApps() {
+			return [...known.keys()].map((appid) => ({
+				appid,
+				display_name: known.get(appid).strDisplayName,
+				rt_last_time_played: appid === 3000000001 ? 1700000000 : 0,
+				BIsShortcut: () => Boolean(known.get(appid).strShortcutExe),
+			}));
+		},
+	};
+});
+
+test('lists the shortcuts Steam holds, including one just added, and no Steam games', async () => {
+	await handle({ action: 'add_shortcut', ...game });
+	const { shortcuts } = await handle({ action: 'list_shortcuts' });
+	expect(shortcuts).toEqual([
+		{ appid: 3000000001, name: 'Old', exe: '"/opt/old/old"', startDir: '"/opt/old"', launchOptions: '', lastPlayed: 1700000000 },
+		{ appid: 3000000002, ...game, lastPlayed: 0 },
+	]);
+});
+
+test('tells shortcuts by app type where Steam has no BIsShortcut', async () => {
+	Object.defineProperty(window.appStore, 'allApps', {
+		value: [
+			{ appid: 440, app_type: 1 },
+			{ appid: 3000000001, app_type: 1073741824, display_name: 'Old' },
+		],
+	});
+	const { shortcuts } = await handle({ action: 'list_shortcuts' });
+	expect(shortcuts.map((s) => s.appid)).toEqual([3000000001]);
+});
+
+test('fails the list, naming the appid, when Steam sends no details for a shortcut it still has', async () => {
+	Object.defineProperty(window.appStore, 'allApps', {
+		value: [{ appid: 3000000001, app_type: 1073741824 }, { appid: 3000000003, app_type: 1073741824 }],
+	});
+	// 3000000003 has an overview but no details.
+	const overview = window.appStore.GetAppOverviewByAppID;
+	window.appStore.GetAppOverviewByAppID = (appid) => (appid === 3000000003 ? { appid } : overview(appid));
+	await expect(handle({ action: 'list_shortcuts' })).rejects.toThrow(
+		'Steam sent no details for shortcut appid 3000000003',
+	);
+});
+
+test('leaves out a shortcut removed while listing', async () => {
+	Object.defineProperty(window.appStore, 'allApps', {
+		value: [{ appid: 3000000001, app_type: 1073741824 }, { appid: 3000000003, app_type: 1073741824 }],
+	});
+	const { shortcuts } = await handle({ action: 'list_shortcuts' });
+	expect(shortcuts.map((s) => s.appid)).toEqual([3000000001]);
+});
+
+test('refuses to list without Steam\'s app list', async () => {
+	delete window.appStore;
+	await expect(handle({ action: 'list_shortcuts' })).rejects.toThrow('no app list');
 });
 
 const game = { name: 'My Game', exe: '"/opt/game/run"', startDir: '"/opt/game"', launchOptions: '-novid' };
@@ -134,6 +189,7 @@ test('refuses to remove without the appStore to confirm it', async () => {
 
 test('parses shortcut requests and refuses malformed ones', () => {
 	expect(parseRequest(JSON.stringify({ action: 'add_shortcut', ...game }))).toEqual({ action: 'add_shortcut', ...game });
+	expect(parseRequest('{"action":"list_shortcuts"}')).toEqual({ action: 'list_shortcuts' });
 	expect(parseRequest('{"action":"remove_shortcut","appid":3000000001}')).toEqual({
 		action: 'remove_shortcut',
 		appid: 3000000001,

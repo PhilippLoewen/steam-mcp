@@ -447,6 +447,40 @@ pub struct BridgeShortcut {
     pub exe: String,
     pub start_dir: String,
     pub launch_options: String,
+    /// Unix seconds, from a list; 0 when never played or not listed.
+    pub last_played: i64,
+}
+
+impl BridgeShortcut {
+    fn from_json(v: &Value) -> Option<Self> {
+        let text = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+        Some(Self {
+            appid: v.get("appid").and_then(Value::as_i64)?,
+            name: text("name"),
+            exe: text("exe"),
+            start_dir: text("startDir"),
+            launch_options: text("launchOptions"),
+            last_played: v.get("lastPlayed").and_then(Value::as_i64).unwrap_or(0),
+        })
+    }
+}
+
+/// The non-Steam shortcuts the running Steam client holds. shortcuts.vdf
+/// trails them by a few seconds after a change. Unavailable as for
+/// [`bridge_shortcut`]; errors are BridgeErrors.
+pub async fn bridge_list_shortcuts(options: &BridgeOptions) -> Result<BridgeOutcome<Vec<BridgeShortcut>>> {
+    let result = match run_bridge_feature(&json!({ "action": "list_shortcuts" }), options, "listing shortcuts").await? {
+        BridgeOutcome::Done(result) => result,
+        BridgeOutcome::Unavailable(why) => return Ok(BridgeOutcome::Unavailable(why)),
+    };
+    let Some(listed) = result.get("shortcuts").and_then(Value::as_array) else {
+        return Err(BridgeError::new(format!("{BRIDGE_PLUGIN} sent no shortcut list in its answer")).into());
+    };
+    let shortcuts: Option<Vec<BridgeShortcut>> = listed.iter().map(BridgeShortcut::from_json).collect();
+    match shortcuts {
+        Some(shortcuts) => Ok(BridgeOutcome::Done(shortcuts)),
+        None => Err(BridgeError::new(format!("{BRIDGE_PLUGIN} listed a shortcut without an appid")).into()),
+    }
 }
 
 /// Add or remove a non-Steam shortcut inside the running Steam client.
@@ -459,17 +493,10 @@ pub async fn bridge_shortcut(
         BridgeOutcome::Done(result) => result,
         BridgeOutcome::Unavailable(why) => return Ok(BridgeOutcome::Unavailable(why)),
     };
-    let text = |key: &str| result.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
-    let Some(appid) = result.get("appid").and_then(Value::as_i64) else {
-        return Err(BridgeError::new(format!("{BRIDGE_PLUGIN} sent no shortcut appid in its answer")).into());
-    };
-    Ok(BridgeOutcome::Done(BridgeShortcut {
-        appid,
-        name: text("name"),
-        exe: text("exe"),
-        start_dir: text("startDir"),
-        launch_options: text("launchOptions"),
-    }))
+    match BridgeShortcut::from_json(&result) {
+        Some(shortcut) => Ok(BridgeOutcome::Done(shortcut)),
+        None => Err(BridgeError::new(format!("{BRIDGE_PLUGIN} sent no shortcut appid in its answer")).into()),
+    }
 }
 
 /// Send one JSON request to the bridge plugin and return its result. Returns
@@ -1066,6 +1093,7 @@ mod tests {
                 exe: "\"/g/run\"".into(),
                 start_dir: "\"/g\"".into(),
                 launch_options: String::new(),
+                last_played: 0,
             })
         );
         bridge_shortcut(&ShortcutRequest::Remove { appid: 3000000002 }, &opts).await.unwrap();
@@ -1076,6 +1104,52 @@ mod tests {
                 json!({ "action": "remove_shortcut", "appid": 3000000002u64 }),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn lists_the_shortcuts_steam_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options(&dir);
+        let fake = Fake {
+            plugin: Some(Arc::new(|req: Value| {
+                assert_eq!(req, json!({ "action": "list_shortcuts" }));
+                Some(json!({ "ok": true, "result": { "shortcuts": [
+                    { "appid": 3000000001u64, "name": "Old", "exe": "\"/o\"", "startDir": "\"/\"", "launchOptions": "", "lastPlayed": 1700000000 },
+                    { "appid": 3000000002u64, "name": "New", "exe": "\"/n\"", "startDir": "\"/\"", "launchOptions": "-x", "lastPlayed": 0 },
+                ]}}))
+            })),
+            ..installed()
+        };
+        let _server = serve(&opts.socket_path, fake);
+        let BridgeOutcome::Done(listed) = bridge_list_shortcuts(&opts).await.unwrap() else { panic!("unavailable") };
+        assert_eq!(listed.len(), 2);
+        assert_eq!((listed[0].appid, listed[0].last_played), (3000000001, 1700000000));
+        assert_eq!((listed[1].name.as_str(), listed[1].launch_options.as_str()), ("New", "-x"));
+    }
+
+    #[tokio::test]
+    async fn a_list_entry_without_an_appid_is_an_error_and_an_old_plugin_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options(&dir);
+        let fake = Fake {
+            plugin: Some(Arc::new(|_| Some(json!({ "ok": true, "result": { "shortcuts": [{ "name": "No id" }] } })))),
+            ..installed()
+        };
+        let _server = serve(&opts.socket_path, fake);
+        let err = bridge_list_shortcuts(&opts).await.unwrap_err();
+        assert!(err.to_string().contains("without an appid"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options(&dir);
+        let fake = Fake {
+            plugin: Some(Arc::new(|_| Some(json!({ "ok": false, "error": "Unknown action \"list_shortcuts\"" })))),
+            ..installed()
+        };
+        let _server = serve(&opts.socket_path, fake);
+        match bridge_list_shortcuts(&opts).await.unwrap() {
+            BridgeOutcome::Unavailable(why) => assert!(why.contains("too old to handle listing shortcuts"), "{why}"),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
     }
 
     #[tokio::test]

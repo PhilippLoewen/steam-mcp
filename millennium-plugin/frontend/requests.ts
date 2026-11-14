@@ -33,6 +33,7 @@ export function handle(request: Request): Promise<unknown> {
 			return launchOptions.handle(request);
 		case 'add_shortcut':
 		case 'remove_shortcut':
+		case 'list_shortcuts':
 			return shortcuts.handle(request);
 		default:
 			return collections.handle(request);
