@@ -201,22 +201,11 @@ function requireName(value: unknown, field: string): string {
 }
 
 /**
- * Parse and check a request from the config key. Any local program that can
- * reach Millennium's socket can write one, so nothing is trusted: the action
- * must be known, names non-empty strings, appids a bounded list of positive
- * whole numbers.
+ * Check a category request's fields (see parseRequest in requests.ts): the
+ * action must be known, names non-empty strings, appids a bounded list of
+ * positive whole numbers.
  */
-export function parseRequest(raw: string): Request {
-	let data: unknown;
-	try {
-		data = JSON.parse(raw);
-	} catch {
-		throw new Error('The request is not valid JSON');
-	}
-	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-		throw new Error('The request must be a JSON object');
-	}
-	const fields = data as Record<string, unknown>;
+export function parse(fields: Record<string, unknown>): Request {
 	const action = fields.action;
 	switch (action) {
 		case 'add':

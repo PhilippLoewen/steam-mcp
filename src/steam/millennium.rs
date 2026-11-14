@@ -1,10 +1,11 @@
-//! Live category edits through the steam-mcp-bridge Millennium plugin
-//! (millennium-plugin/ in this repo), so Steam doesn't have to be closed.
+//! Live category and launch options edits through the steam-mcp-bridge
+//! Millennium plugin (millennium-plugin/ in this repo), so Steam doesn't have
+//! to be closed.
 //!
 //! Millennium serves a local socket (MEP) whose plugin.config.set fires the
 //! plugin's Lua config.on_change. A request goes to config key request:<id>;
-//! the plugin runs it against Steam's collectionStore and answers in
-//! response:<id>, which is polled here.
+//! the plugin runs it inside the Steam client and answers in response:<id>,
+//! which is polled here.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -110,7 +111,8 @@ impl MepClient {
             if let Some(m) = self.queued.pop_front() {
                 return Ok(m);
             }
-            let mut buf = [0u8; 64 * 1024];
+            // On the heap: in the future's state it would cost every caller 64 KiB of stack.
+            let mut buf = vec![0u8; 64 * 1024];
             let n = self.stream.read(&mut buf).await?;
             if n == 0 {
                 bail!("Millennium closed the connection");
@@ -247,19 +249,163 @@ impl Default for BridgeOptions {
     }
 }
 
-/// What came of a bridge edit that didn't fail.
+/// What came of a bridge request that didn't fail.
 #[derive(Debug, Clone, PartialEq)]
-pub enum BridgeOutcome {
-    Done(BridgeResult),
-    /// Why the bridge couldn't be used; nothing was sent to Steam.
+pub enum BridgeOutcome<T = BridgeResult> {
+    Done(T),
+    /// Why the bridge couldn't be used; nothing was changed in Steam.
     Unavailable(String),
 }
 
-/// Run an edit through the bridge plugin. Returns Unavailable when the bridge
-/// can't be reached (no socket, plugin missing or stopped) so the caller can
-/// fall back. Once the request is sent, every failure is a CategoryError.
-#[cfg(unix)]
+/// A failure after the request reached the bridge, worded for the user.
+#[derive(Debug, Clone)]
+pub struct BridgeError {
+    pub message: String,
+    /// The plugin got the request but never answered (it may still have applied it).
+    pub timeout: bool,
+}
+
+impl BridgeError {
+    fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into(), timeout: false }
+    }
+}
+
+impl std::fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BridgeError {}
+
+/// Run a category edit through the bridge plugin. Returns Unavailable when the
+/// bridge can't be reached (no socket, plugin missing or stopped) so the caller
+/// can fall back. Once the request is sent, every failure is a CategoryError.
 pub async fn run_bridge_edit(request: &BridgeRequest, options: &BridgeOptions) -> Result<BridgeOutcome> {
+    match run_bridge(&request.to_json(), options).await {
+        Ok(BridgeOutcome::Done(result)) => Ok(BridgeOutcome::Done(BridgeResult::from_json(&result))),
+        Ok(BridgeOutcome::Unavailable(why)) => Ok(BridgeOutcome::Unavailable(why)),
+        Err(e) => Err(match e.downcast::<BridgeError>() {
+            Ok(be) if be.timeout => CategoryError::timeout(be.message).into(),
+            Ok(be) => CategoryError::new(be.message).into(),
+            Err(e) => e,
+        }),
+    }
+}
+
+/// A launch options read or write for the bridge plugin.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LaunchOptionsRequest {
+    Get {
+        appid: i64,
+    },
+    /// With `expected`, the plugin refuses when Steam's current launch options differ from it.
+    Set {
+        appid: i64,
+        options: String,
+        expected: Option<String>,
+    },
+}
+
+impl LaunchOptionsRequest {
+    pub fn to_json(&self) -> Value {
+        match self {
+            LaunchOptionsRequest::Get { appid } => json!({ "action": "get_launch_options", "appid": appid }),
+            LaunchOptionsRequest::Set { appid, options, expected } => {
+                let mut request = json!({ "action": "set_launch_options", "appid": appid, "options": options });
+                if let Some(expected) = expected {
+                    request["expected"] = expected.clone().into();
+                }
+                request
+            }
+        }
+    }
+}
+
+/// A game's launch options as the running Steam client holds them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeLaunchOptions {
+    pub launch_options: String,
+    /// For a write: whether Steam's launch options changed.
+    pub changed: bool,
+    /// For a write the plugin never confirmed: a read afterwards showed it applied.
+    pub verified_by_readback: bool,
+}
+
+/// How long the read after an unconfirmed write may take.
+const READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read or set a game's launch options inside the running Steam client.
+/// Unavailable as for [`run_bridge_edit`], and also when the installed plugin
+/// predates launch options (it refuses them without changing anything); errors
+/// are BridgeErrors. A write the plugin doesn't confirm in time is read back.
+pub async fn bridge_launch_options(
+    request: &LaunchOptionsRequest,
+    options: &BridgeOptions,
+) -> Result<BridgeOutcome<BridgeLaunchOptions>> {
+    let err = match exchange_launch_options(request, options).await {
+        Err(e) if e.downcast_ref::<BridgeError>().is_some_and(|be| be.timeout) => e,
+        other => return other,
+    };
+    let LaunchOptionsRequest::Set { appid, options: wanted, expected } = request else {
+        return Err(BridgeError {
+            message: format!(
+                "The {BRIDGE_PLUGIN} Millennium plugin did not answer within {}s.",
+                js_num(options.timeout.as_secs_f64())
+            ),
+            timeout: true,
+        }
+        .into());
+    };
+    // Reads don't wait for queued writes in the plugin, so a write it already
+    // took can still land after a read-back that doesn't show it yet.
+    let readback = BridgeOptions { socket_path: options.socket_path.clone(), timeout: READBACK_TIMEOUT, ..*options };
+    match exchange_launch_options(&LaunchOptionsRequest::Get { appid: *appid }, &readback).await {
+        Ok(BridgeOutcome::Done(now)) if now.launch_options == *wanted => {
+            // Without `expected`, Steam may have held these options already; assume the write did it.
+            let changed = expected.as_ref().is_none_or(|previous| previous != wanted);
+            Ok(BridgeOutcome::Done(BridgeLaunchOptions { changed, verified_by_readback: true, ..now }))
+        }
+        Ok(BridgeOutcome::Done(_)) => Err(BridgeError {
+            message: format!("{err} Steam doesn't show the new launch options yet; check them before retrying."),
+            timeout: true,
+        }
+        .into()),
+        _ => Err(err),
+    }
+}
+
+async fn exchange_launch_options(
+    request: &LaunchOptionsRequest,
+    options: &BridgeOptions,
+) -> Result<BridgeOutcome<BridgeLaunchOptions>> {
+    let result = match run_bridge(&request.to_json(), options).await {
+        Ok(BridgeOutcome::Done(result)) => result,
+        Ok(BridgeOutcome::Unavailable(why)) => return Ok(BridgeOutcome::Unavailable(why)),
+        Err(e) if e.downcast_ref::<BridgeError>().is_some_and(|be| be.message.starts_with("Unknown action")) => {
+            return Ok(BridgeOutcome::Unavailable(format!(
+                "the installed {BRIDGE_PLUGIN} is too old to handle launch options; rebuild it \
+                 (bun run build in millennium-plugin/) and restart Steam"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(launch_options) = result.get("launchOptions").and_then(Value::as_str) else {
+        return Err(BridgeError::new(format!("{BRIDGE_PLUGIN} sent no launch options in its answer")).into());
+    };
+    Ok(BridgeOutcome::Done(BridgeLaunchOptions {
+        launch_options: launch_options.to_string(),
+        changed: result.get("changed").and_then(Value::as_bool).unwrap_or(false),
+        verified_by_readback: false,
+    }))
+}
+
+/// Send one JSON request to the bridge plugin and return its result. Returns
+/// Unavailable when the bridge can't be reached (no socket, plugin missing or
+/// stopped). Once the request is sent, every failure is a BridgeError.
+#[cfg(unix)]
+async fn run_bridge(request: &Value, options: &BridgeOptions) -> Result<BridgeOutcome<Value>> {
     let socket_path = &options.socket_path;
     if !socket_path.exists() {
         return Ok(BridgeOutcome::Unavailable(format!(
@@ -279,9 +425,9 @@ pub async fn run_bridge_edit(request: &BridgeRequest, options: &BridgeOptions) -
 #[cfg(unix)]
 async fn bridge_exchange(
     client: &mut MepClient,
-    request: &BridgeRequest,
+    request: &Value,
     options: &BridgeOptions,
-) -> Result<BridgeOutcome> {
+) -> Result<BridgeOutcome<Value>> {
     const CALL_TIMEOUT: Duration = Duration::from_secs(5);
     let status = match client.call("plugin.status", json!({ "name": BRIDGE_PLUGIN }), CALL_TIMEOUT).await {
         Ok(s) => s,
@@ -297,7 +443,7 @@ async fn bridge_exchange(
     let response_key = format!("response:{id}");
 
     let exchange: Result<Option<Map<String, Value>>> = async {
-        let set = json!({ "name": BRIDGE_PLUGIN, "key": request_key, "value": request.to_json().to_string() });
+        let set = json!({ "name": BRIDGE_PLUGIN, "key": request_key, "value": request.to_string() });
         client.call("plugin.config.set", set, CALL_TIMEOUT).await?;
         // Every call and pause is cut to the time left, so the wait ends at the deadline.
         let deadline = tokio::time::Instant::now() + options.timeout;
@@ -326,9 +472,7 @@ async fn bridge_exchange(
     .await;
 
     let response = exchange.map_err(|e| {
-        CategoryError::new(format!(
-            "Lost the connection to Millennium ({e}); the edit may or may not have been applied."
-        ))
+        BridgeError::new(format!("Lost the connection to Millennium ({e}); the edit may or may not have been applied."))
     })?;
 
     let Some(response) = response else {
@@ -340,10 +484,13 @@ async fn bridge_exchange(
             }
         };
         let _ = tokio::time::timeout(Duration::from_secs(1), withdraw).await;
-        return Err(CategoryError::timeout(format!(
-            "The {BRIDGE_PLUGIN} Millennium plugin did not answer within {}s; the edit may or may not have been applied.",
-            js_num(options.timeout.as_secs_f64())
-        ))
+        return Err(BridgeError {
+            message: format!(
+                "The {BRIDGE_PLUGIN} Millennium plugin did not answer within {}s; the edit may or may not have been applied.",
+                js_num(options.timeout.as_secs_f64())
+            ),
+            timeout: true,
+        }
         .into());
     };
     let _ =
@@ -355,14 +502,14 @@ async fn bridge_exchange(
             Some(other) => other.to_string(),
             None => "undefined".to_string(),
         };
-        return Err(CategoryError::new(error).into());
+        return Err(BridgeError::new(error).into());
     }
-    Ok(BridgeOutcome::Done(BridgeResult::from_json(response.get("result").unwrap_or(&Value::Null))))
+    Ok(BridgeOutcome::Done(response.get("result").cloned().unwrap_or(Value::Null)))
 }
 
 /// Unix sockets aren't wired up on this platform, so the bridge is never available.
 #[cfg(not(unix))]
-pub async fn run_bridge_edit(_request: &BridgeRequest, options: &BridgeOptions) -> Result<BridgeOutcome> {
+async fn run_bridge(_request: &Value, options: &BridgeOptions) -> Result<BridgeOutcome<Value>> {
     if !options.socket_path.exists() {
         return Ok(BridgeOutcome::Unavailable(format!(
             "Millennium is not running (no socket at {})",
@@ -702,6 +849,119 @@ mod tests {
         let err = run_bridge_edit(&create(), &opts).await.unwrap_err();
         let ce = err.downcast_ref::<CategoryError>().expect("CategoryError");
         assert!(ce.message.contains("may or may not have been applied"));
+    }
+
+    #[tokio::test]
+    async fn launch_options_requests_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options(&dir);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        let fake = Fake {
+            plugin: Some(Arc::new(move |req: Value| {
+                seen_in.lock().unwrap().push(req.clone());
+                let changed = req["action"] == "set_launch_options";
+                Some(json!({ "ok": true, "result": { "appid": 10, "launchOptions": "-novid", "changed": changed } }))
+            })),
+            ..installed()
+        };
+        let _server = serve(&opts.socket_path, fake);
+
+        let answer = |changed| {
+            BridgeOutcome::Done(BridgeLaunchOptions {
+                launch_options: "-novid".into(),
+                changed,
+                verified_by_readback: false,
+            })
+        };
+        let get = bridge_launch_options(&LaunchOptionsRequest::Get { appid: 10 }, &opts).await.unwrap();
+        assert_eq!(get, answer(false));
+        let set = LaunchOptionsRequest::Set { appid: 10, options: "-novid".into(), expected: Some(String::new()) };
+        let set = bridge_launch_options(&set, &opts).await.unwrap();
+        assert_eq!(set, answer(true));
+        let unchecked = LaunchOptionsRequest::Set { appid: 10, options: "-x".into(), expected: None };
+        bridge_launch_options(&unchecked, &opts).await.unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                json!({ "action": "get_launch_options", "appid": 10 }),
+                json!({ "action": "set_launch_options", "appid": 10, "options": "-novid", "expected": "" }),
+                json!({ "action": "set_launch_options", "appid": 10, "options": "-x" }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_plugin_counts_as_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options(&dir);
+        let fake = Fake {
+            plugin: Some(Arc::new(|_| Some(json!({ "ok": false, "error": "Unknown action \"get_launch_options\"" })))),
+            ..installed()
+        };
+        let _server = serve(&opts.socket_path, fake);
+        for request in [
+            LaunchOptionsRequest::Get { appid: 10 },
+            LaunchOptionsRequest::Set { appid: 10, options: "-x".into(), expected: None },
+        ] {
+            let why = unavailable_launch(bridge_launch_options(&request, &opts).await.unwrap());
+            assert!(why.contains("too old") && why.contains("rebuild"), "{why}");
+        }
+    }
+
+    fn unavailable_launch(outcome: BridgeOutcome<BridgeLaunchOptions>) -> String {
+        match outcome {
+            BridgeOutcome::Unavailable(why) => why,
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_timeout_is_not_called_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = BridgeOptions { timeout: Duration::from_millis(50), ..options(&dir) };
+        let _server = serve(&opts.socket_path, installed());
+        let err = bridge_launch_options(&LaunchOptionsRequest::Get { appid: 10 }, &opts).await.unwrap_err();
+        assert!(err.downcast_ref::<BridgeError>().is_some_and(|e| e.timeout), "{err}");
+        assert!(!err.to_string().contains("edit"), "{err}");
+    }
+
+    /// A plugin that applies writes but never answers them, and answers reads.
+    fn silent_writer(steam_holds: &'static str) -> Fake {
+        Fake {
+            plugin: Some(Arc::new(move |req: Value| {
+                (req["action"] == "get_launch_options").then(
+                    || json!({ "ok": true, "result": { "appid": 10, "launchOptions": steam_holds, "changed": false } }),
+                )
+            })),
+            ..installed()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_write_is_read_back() {
+        let set = LaunchOptionsRequest::Set { appid: 10, options: "-novid".into(), expected: None };
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = BridgeOptions { timeout: Duration::from_millis(50), ..options(&dir) };
+        let _server = serve(&opts.socket_path, silent_writer("-novid"));
+        let outcome = bridge_launch_options(&set, &opts).await.unwrap();
+        assert_eq!(
+            outcome,
+            BridgeOutcome::Done(BridgeLaunchOptions {
+                launch_options: "-novid".into(),
+                changed: true,
+                verified_by_readback: true
+            })
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = BridgeOptions { timeout: Duration::from_millis(50), ..options(&dir) };
+        let _server = serve(&opts.socket_path, silent_writer("-old"));
+        let err = bridge_launch_options(&set, &opts).await.unwrap_err();
+        assert!(err.downcast_ref::<BridgeError>().is_some_and(|e| e.timeout), "{err}");
+        assert!(err.to_string().contains("doesn't show the new launch options yet"), "{err}");
     }
 
     fn rpg() -> Category {

@@ -29,7 +29,7 @@ A user-made or built-in group of games in the Steam library, such as Favorites o
 _Avoid_: collection, tag
 
 **Millennium bridge**:
-The plugin inside the running Steam client through which categories are edited while Steam runs.
+The plugin inside the running Steam client through which categories and launch options are edited while Steam runs.
 
 ### Files the server produces
 
