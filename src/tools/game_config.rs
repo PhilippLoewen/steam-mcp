@@ -183,11 +183,19 @@ pub fn tool() -> Tool {
         description: "Launch options, presets, MangoHud, Steam settings",
         params: vec![
             Param::new("action", ParamType::Enum(ACTIONS)).required(),
-            Param::new("appid", ParamType::Number),
-            Param::new("options", ParamType::String),
-            Param::new("preset", ParamType::String),
-            Param::new("mangohud_action", ParamType::Enum(MANGOHUD_ACTIONS)),
-            Param::new("settings", ParamType::String),
+            Param::new("appid", ParamType::Number).describe(
+                "The game (for \"get_launch_opts\", \"set_launch_opts\", applying a preset, and a game's MangoHud config)",
+            ),
+            Param::new("options", ParamType::String)
+                .describe("The complete new launch options (for \"set_launch_opts\" only; \"\" clears them)"),
+            Param::new("preset", ParamType::String).describe(
+                "Preset name to merge into the game's launch options (for \"presets\" only, with appid; \
+                 omit it to list the presets)",
+            ),
+            Param::new("mangohud_action", ParamType::Enum(MANGOHUD_ACTIONS))
+                .describe("For \"mangohud\": show (default), set, or reset"),
+            Param::new("settings", ParamType::String)
+                .describe("Comma-separated key=value pairs (for \"mangohud\" with mangohud_action \"set\")"),
         ],
         handler: |args| blocking(move || handle(args)),
         writes: &[
@@ -279,11 +287,21 @@ fn get_launch_opts(env: &impl LaunchEnv, args: &Args) -> Result<ToolResult> {
 
 fn set_launch_opts(env: &impl LaunchEnv, args: &Args) -> Result<ToolResult> {
     let _guard = crate::util::file_edit_lock();
+    // A preset passed here used to be ignored silently, and a preset name in
+    // "options" is a valid game argument, so say where presets go, first.
+    if args.str("preset").is_some_and(|p| !p.is_empty()) {
+        return Ok(ToolResult::error(
+            "set_launch_opts doesn't apply presets; launch options were NOT modified. Apply a preset with \
+             action \"presets\", appid and preset (without options).",
+        ));
+    }
     let Some(appid) = truthy_appid(args) else {
         return Ok(ToolResult::error("An appid is required for set_launch_opts."));
     };
     let Some(options) = args.str("options") else {
-        return Ok(ToolResult::error("The \"options\" parameter is required for set_launch_opts."));
+        return Ok(ToolResult::error(
+            "The \"options\" parameter is required for set_launch_opts. To apply a preset, use action \"presets\".",
+        ));
     };
     if let Err(why) = check_launch_options(&options) {
         return Ok(ToolResult::error(format!(
@@ -795,6 +813,23 @@ mod tests {
         assert!(result.text.contains("Millennium bridge: Millennium is not running"), "{}", result.text);
         assert!(result.text.ends_with("Launch options were NOT modified."));
         assert!(env.file.borrow().is_empty());
+    }
+
+    #[test]
+    fn set_refuses_a_preset_instead_of_ignoring_it() {
+        let env = FakeEnv::running(vec![]);
+        for call in [
+            json!({ "appid": 10, "preset": "skip-intro" }),
+            json!({ "appid": 10, "options": "-x", "preset": "force-vulkan" }),
+            json!({ "preset": "skip-intro" }),
+        ] {
+            let result = set_launch_opts(&env, &args(call)).unwrap();
+            assert!(result.is_error && result.text.contains("action \"presets\""), "{}", result.text);
+        }
+        assert!(env.requests.borrow().is_empty());
+        let closed = FakeEnv::default();
+        assert!(set_launch_opts(&closed, &args(json!({ "appid": 10, "preset": "skip-intro" }))).unwrap().is_error);
+        assert!(closed.file.borrow().is_empty());
     }
 
     #[test]

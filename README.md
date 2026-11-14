@@ -259,8 +259,8 @@ Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talk
 | Action | Description |
 |--------|-------------|
 | `get_launch_opts` | Read current launch options |
-| `set_launch_opts` | Set launch options ([accepted forms](#what-the-tools-may-write)); while Steam runs, through the [Millennium bridge](#editing-while-steam-runs) |
-| `presets` | List/apply launch option presets (MangoHud, GameMode, Vulkan, etc.) |
+| `set_launch_opts` | Set launch options ([accepted forms](#what-the-tools-may-write)); while Steam runs, through the [Millennium bridge](#editing-while-steam-runs); refuses a `preset` (use `presets`) |
+| `presets` | List launch option presets (MangoHud, GameMode, Vulkan, etc.), or apply one (`appid`, `preset`) |
 | `mangohud` | Show, set, or reset the global or a game's MangoHud configuration |
 | `steam_settings` | View Steam client settings |
 
