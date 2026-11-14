@@ -1,5 +1,5 @@
 /**
- * Non-Steam shortcuts added and removed through the Steam client's own
+ * Non-Steam shortcuts listed, added and removed through the Steam client's own
  * SteamClient.Apps calls. Steam keeps shortcuts in memory and rewrites
  * shortcuts.vdf from it, so an edit made here sticks while Steam runs.
  */
@@ -17,7 +17,8 @@ import {
 
 export type Request =
 	| { action: 'add_shortcut'; name: string; exe: string; startDir: string; launchOptions: string }
-	| { action: 'remove_shortcut'; appid: number };
+	| { action: 'remove_shortcut'; appid: number }
+	| { action: 'list_shortcuts' };
 
 export interface Shortcut {
 	appid: number;
@@ -27,11 +28,28 @@ export interface Shortcut {
 	launchOptions: string;
 }
 
-export const ACTIONS: readonly string[] = ['add_shortcut', 'remove_shortcut'];
+export interface ListedShortcut extends Shortcut {
+	/** Unix seconds; 0 when never played. */
+	lastPlayed: number;
+}
+
+export const ACTIONS: readonly string[] = ['add_shortcut', 'remove_shortcut', 'list_shortcuts'];
+
+interface AppOverview {
+	appid: number;
+	display_name?: string;
+	rt_last_time_played?: number;
+	app_type?: number;
+	BIsShortcut?(): boolean;
+}
 
 interface AppStore {
 	GetAppOverviewByAppID?(appid: number): unknown;
+	allApps?: AppOverview[];
 }
+
+/** EAppType.Shortcut, for overviews without BIsShortcut. */
+const SHORTCUT_APP_TYPE = 1073741824;
 
 function describe(appid: number, details: AppDetails): Shortcut {
 	return {
@@ -127,11 +145,50 @@ async function removeShortcut(appid: number): Promise<Shortcut> {
 }
 
 /**
+ * The shortcuts Steam holds now. shortcuts.vdf trails them by a few seconds
+ * after a change, so steam-mcp reads them here while Steam runs.
+ */
+async function listShortcuts(): Promise<{ shortcuts: ListedShortcut[] }> {
+	steamApps('RegisterForAppDetails');
+	const allApps = (window as unknown as { appStore?: AppStore }).appStore?.allApps;
+	if (!Array.isArray(allApps)) {
+		throw new Error("Steam's appStore has no app list to read shortcuts from");
+	}
+	const isShortcut = (app: AppOverview) =>
+		typeof app.BIsShortcut === 'function' ? app.BIsShortcut() : app.app_type === SHORTCUT_APP_TYPE;
+	// Details for all of them at once: each wait ends within DETAILS_TIMEOUT_MS.
+	const listed = await Promise.all(
+		allApps.filter(isShortcut).map(async (app): Promise<ListedShortcut | null> => {
+			const { details } = await waitForDetails(app.appid, () => true);
+			if (!details) {
+				// Removed while listing: leave it out. Still there: its program and
+				// folder are unknown, and listing them empty would be wrong.
+				const appStore = (window as unknown as { appStore?: AppStore }).appStore;
+				const lookup = appStore?.GetAppOverviewByAppID;
+				const stillThere = typeof lookup === 'function' ? Boolean(lookup.call(appStore, app.appid)) : true;
+				if (!stillThere) return null;
+				throw new Error(
+					`Steam sent no details for shortcut appid ${app.appid} within ${DETAILS_TIMEOUT_MS / 1000}s; try listing again`,
+				);
+			}
+			const shortcut = describe(app.appid, details);
+			return {
+				...shortcut,
+				name: shortcut.name || app.display_name || '',
+				lastPlayed: app.rt_last_time_played ?? 0,
+			};
+		}),
+	);
+	return { shortcuts: listed.filter((s): s is ListedShortcut => s !== null) };
+}
+
+/**
  * Check a shortcut request. Only its shape: which programs and launch options
  * are acceptable is steam-mcp's check, and a program that can reach
  * Millennium's socket could write shortcuts.vdf just as well.
  */
 export function parse(fields: Record<string, unknown>): Request {
+	if (fields.action === 'list_shortcuts') return { action: 'list_shortcuts' };
 	if (fields.action === 'remove_shortcut') return { action: 'remove_shortcut', appid: requireAppid(fields.appid) };
 	if (fields.action !== 'add_shortcut') throw new Error(`Unknown action ${JSON.stringify(fields.action)}`);
 	return {
@@ -143,8 +200,14 @@ export function parse(fields: Record<string, unknown>): Request {
 	};
 }
 
-export function handle(request: Request): Promise<Shortcut> {
-	return request.action === 'add_shortcut'
-		? serialize(() => addShortcut(request))
-		: serialize(() => removeShortcut(request.appid));
+export function handle(request: Request): Promise<Shortcut | { shortcuts: ListedShortcut[] }> {
+	switch (request.action) {
+		case 'add_shortcut':
+			return serialize(() => addShortcut(request));
+		case 'remove_shortcut':
+			return serialize(() => removeShortcut(request.appid));
+		case 'list_shortcuts':
+			// A read: it doesn't wait for queued writes.
+			return listShortcuts();
+	}
 }
