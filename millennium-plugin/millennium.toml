@@ -2,9 +2,9 @@
 # The id is the name steam-mcp uses on Millennium's socket; keep it in sync with BRIDGE_PLUGIN.
 id = "steam-mcp-bridge"
 name = "Steam MCP Bridge"
-version = "1.1.0"
+version = "1.2.0"
 author = "Praeses0"
-description = "Lets steam-mcp edit library categories and launch options while Steam is running."
+description = "Lets steam-mcp edit library categories, launch options and shortcuts while Steam is running."
 
 [backend]
 entry = "backend/main.lua"

@@ -1,7 +1,8 @@
 import * as collections from './collections';
 import * as launchOptions from './launch-options';
+import * as shortcuts from './shortcuts';
 
-export type Request = collections.Request | launchOptions.Request;
+export type Request = collections.Request | launchOptions.Request | shortcuts.Request;
 
 /**
  * Parse and check a request from the config key. Any local program that can
@@ -19,9 +20,10 @@ export function parseRequest(raw: string): Request {
 		throw new Error('The request must be a JSON object');
 	}
 	const fields = data as Record<string, unknown>;
-	return launchOptions.ACTIONS.includes(fields.action as string)
-		? launchOptions.parse(fields)
-		: collections.parse(fields);
+	const action = fields.action as string;
+	if (launchOptions.ACTIONS.includes(action)) return launchOptions.parse(fields);
+	if (shortcuts.ACTIONS.includes(action)) return shortcuts.parse(fields);
+	return collections.parse(fields);
 }
 
 export function handle(request: Request): Promise<unknown> {
@@ -29,6 +31,9 @@ export function handle(request: Request): Promise<unknown> {
 		case 'get_launch_options':
 		case 'set_launch_options':
 			return launchOptions.handle(request);
+		case 'add_shortcut':
+		case 'remove_shortcut':
+			return shortcuts.handle(request);
 		default:
 			return collections.handle(request);
 	}

@@ -163,7 +163,7 @@ MangoHud `set` refuses the keys that run commands, write files or upload logs (`
 
 Edits to `localconfig.vdf`, `shortcuts.vdf` and MangoHud configs are atomic. The previous version is kept as `<file>.<time>.bak`, and the newest five backups are kept. A `localconfig.vdf` or `shortcuts.vdf` that can't be read back exactly (damaged, cut off, not UTF-8) is left alone.
 
-Launch options, presets and shortcuts can only be changed in those files while Steam is closed, because Steam rewrites them from memory when it exits. While Steam runs, launch options, presets and category edits go through the [Millennium bridge](#editing-while-steam-runs) when it is installed, and are refused without it; shortcuts need Steam closed. To tell whether Steam runs, steam-mcp uses `pgrep` on Linux and macOS and `tasklist` on Windows. If that check fails, these edits are refused as if Steam were running. steam-mcp has to see Steam's processes: in a sandbox or container with its own process list, Steam looks closed and these edits are not refused.
+Launch options, presets and shortcuts can only be changed in those files while Steam is closed, because Steam rewrites them from memory when it exits. While Steam runs, these and category edits go through the [Millennium bridge](#editing-while-steam-runs) when it is installed, and are refused without it. To tell whether Steam runs, steam-mcp uses `pgrep` on Linux and macOS and `tasklist` on Windows. If that check fails, these edits are refused as if Steam were running. steam-mcp has to see Steam's processes: in a sandbox or container with its own process list, Steam looks closed and these edits are not refused.
 
 ### Prerequisites
 
@@ -205,7 +205,7 @@ While Steam is **running**, category edits go through the [steam-mcp-bridge Mill
 
 #### Editing while Steam runs
 
-Steam keeps categories and launch options in memory, so editing their files under a running Steam doesn't stick. With [Millennium](https://steambrew.app/) (v3.4+) installed, the bundled `millennium-plugin/` makes the edit inside the Steam client: categories through its collection store, launch options through `SteamClient.Apps.SetAppLaunchOptions`. Steam then saves them (and cloud-syncs categories) as if you had made the change in the library.
+Steam keeps categories, launch options and shortcuts in memory, so editing their files under a running Steam doesn't stick. With [Millennium](https://steambrew.app/) (v3.4+) installed, the bundled `millennium-plugin/` makes the edit inside the Steam client: categories through its collection store, launch options and shortcuts through `SteamClient.Apps`. Steam then saves them (and cloud-syncs categories) as if you had made the change in the library.
 
 ```bash
 cd millennium-plugin
@@ -213,7 +213,7 @@ bun install
 bun run build      # packs steam-mcp-bridge.star into the Millennium plugins folder
 ```
 
-Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talks to Millennium over `/tmp/millennium-mep.sock`; set `MILLENNIUM_MEP_SOCKET` if yours lives elsewhere (e.g. when the MCP server runs in a sandbox with a private `/tmp`). The socket must belong to your user and be served by a process of your user; otherwise the bridge isn't used. The bridge works on Linux and macOS; on Windows, these edits need Steam closed. Live edits only cover games Steam knows in this library, not non-Steam shortcuts. Renaming categories and setting launch options rely on Steam client internals, so they report an error if a Steam update breaks them. While Steam runs, `get_launch_opts` also reads through the bridge, since `localconfig.vdf` lags behind Steam; without the bridge it reads the file and adds a `note` that it may be out of date. Preset and MangoHud edits recheck the game's launch options right before writing and refuse when they find them changed in Steam; an edit in Steam's own dialog at that very moment can still slip through. After updating steam-mcp, rebuild the plugin: an older one can't handle launch options, so they are handled as if the bridge were missing, and the result says to rebuild it.
+Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talks to Millennium over `/tmp/millennium-mep.sock`; set `MILLENNIUM_MEP_SOCKET` if yours lives elsewhere (e.g. when the MCP server runs in a sandbox with a private `/tmp`). The socket must belong to your user and be served by a process of your user; otherwise the bridge isn't used. The bridge works on Linux and macOS; on Windows, these edits need Steam closed. Live edits only cover games Steam knows in this library, and live launch options edits don't cover shortcuts. Renaming categories, setting launch options and editing shortcuts rely on Steam client internals, so they report an error if a Steam update breaks them. A shortcut added while Steam runs gets an appid Steam picks, and no tags: put it into a category with `library category_add` instead. Removing a shortcut by name looks its appid up in `shortcuts.vdf`; one Steam hasn't saved there yet can be removed by appid. Likewise, `import_lutris` skips games by the names in `shortcuts.vdf`, which may not list shortcuts just added while Steam runs. While Steam runs, `get_launch_opts` also reads through the bridge, since `localconfig.vdf` lags behind Steam; without the bridge it reads the file and adds a `note` that it may be out of date. Preset and MangoHud edits recheck the game's launch options right before writing and refuse when they find them changed in Steam; an edit in Steam's own dialog at that very moment can still slip through. After updating steam-mcp, rebuild the plugin: an older one can't handle launch options or shortcuts, so they are handled as if the bridge were missing, and the result says to rebuild it.
 
 ### `steam_status` — Steam client status
 | Action | Description |
@@ -288,9 +288,9 @@ Then enable **Steam MCP Bridge** in Millennium's plugin settings. steam-mcp talk
 | Action | Description |
 |--------|-------------|
 | `list` | List all non-Steam shortcuts |
-| `add` | Add a new shortcut |
-| `remove` | Remove a shortcut |
-| `import_lutris` | Import games from Lutris |
+| `add` | Add a new shortcut; while Steam runs, through the [Millennium bridge](#editing-while-steam-runs) |
+| `remove` | Remove a shortcut; while Steam runs, through the bridge |
+| `import_lutris` | Import games from Lutris; while Steam runs, through the bridge |
 
 ### `deals` — Pricing and wishlist
 | Action | Description |
@@ -370,11 +370,11 @@ src/
 │   ├── workshop.rs          # Workshop manifest reading
 │   ├── shortcuts.rs         # Binary shortcuts.vdf read/write
 │   ├── categories.rs        # Library categories (cloud-storage-namespace-1.json) read/write
-│   ├── millennium.rs        # Live category and launch options edits via the Millennium bridge plugin
+│   ├── millennium.rs        # Live category, launch options and shortcut edits via the Millennium bridge plugin
 │   ├── api.rs               # Steam Web API / Store API client
 │   └── wishlist.rs          # Wishlist, store details and prices
 └── tools/                   # 14 consolidated MCP tools (one file per tool)
-millennium-plugin/           # steam-mcp-bridge: Millennium plugin for live category and launch options edits
+millennium-plugin/           # steam-mcp-bridge: Millennium plugin for live category, launch options and shortcut edits
 ```
 
 ## License

@@ -263,11 +263,22 @@ pub struct BridgeError {
     pub message: String,
     /// The plugin got the request but never answered (it may still have applied it).
     pub timeout: bool,
+    /// Whether the request ran is unknown: it timed out or the connection dropped.
+    pub outcome_unknown: bool,
 }
 
 impl BridgeError {
     fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), timeout: false }
+        Self { message: message.into(), timeout: false, outcome_unknown: false }
+    }
+
+    fn timeout(message: impl Into<String>) -> Self {
+        Self { message: message.into(), timeout: true, outcome_unknown: true }
+    }
+
+    /// Whether `e` is a bridge failure after which the request may or may not have run.
+    pub fn outcome_unknown(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<BridgeError>().is_some_and(|be| be.outcome_unknown)
     }
 }
 
@@ -349,13 +360,10 @@ pub async fn bridge_launch_options(
         other => return other,
     };
     let LaunchOptionsRequest::Set { appid, options: wanted, expected } = request else {
-        return Err(BridgeError {
-            message: format!(
-                "The {BRIDGE_PLUGIN} Millennium plugin did not answer within {}s.",
-                js_num(options.timeout.as_secs_f64())
-            ),
-            timeout: true,
-        }
+        return Err(BridgeError::timeout(format!(
+            "The {BRIDGE_PLUGIN} Millennium plugin did not answer within {}s.",
+            js_num(options.timeout.as_secs_f64())
+        ))
         .into());
     };
     // Reads don't wait for queued writes in the plugin, so a write it already
@@ -367,12 +375,25 @@ pub async fn bridge_launch_options(
             let changed = expected.as_ref().is_none_or(|previous| previous != wanted);
             Ok(BridgeOutcome::Done(BridgeLaunchOptions { changed, verified_by_readback: true, ..now }))
         }
-        Ok(BridgeOutcome::Done(_)) => Err(BridgeError {
-            message: format!("{err} Steam doesn't show the new launch options yet; check them before retrying."),
-            timeout: true,
-        }
+        Ok(BridgeOutcome::Done(_)) => Err(BridgeError::timeout(format!(
+            "{err} Steam doesn't show the new launch options yet; check them before retrying."
+        ))
         .into()),
         _ => Err(err),
+    }
+}
+
+/// [`run_bridge`] for a request a plugin built before `feature` was bridged
+/// refuses, without changing anything: such a plugin counts as unavailable.
+async fn run_bridge_feature(request: &Value, options: &BridgeOptions, feature: &str) -> Result<BridgeOutcome<Value>> {
+    match run_bridge(request, options).await {
+        Err(e) if e.downcast_ref::<BridgeError>().is_some_and(|be| be.message.starts_with("Unknown action")) => {
+            Ok(BridgeOutcome::Unavailable(format!(
+                "the installed {BRIDGE_PLUGIN} is too old to handle {feature}; rebuild it \
+                 (bun run build in millennium-plugin/) and restart Steam"
+            )))
+        }
+        other => other,
     }
 }
 
@@ -380,16 +401,9 @@ async fn exchange_launch_options(
     request: &LaunchOptionsRequest,
     options: &BridgeOptions,
 ) -> Result<BridgeOutcome<BridgeLaunchOptions>> {
-    let result = match run_bridge(&request.to_json(), options).await {
-        Ok(BridgeOutcome::Done(result)) => result,
-        Ok(BridgeOutcome::Unavailable(why)) => return Ok(BridgeOutcome::Unavailable(why)),
-        Err(e) if e.downcast_ref::<BridgeError>().is_some_and(|be| be.message.starts_with("Unknown action")) => {
-            return Ok(BridgeOutcome::Unavailable(format!(
-                "the installed {BRIDGE_PLUGIN} is too old to handle launch options; rebuild it \
-                 (bun run build in millennium-plugin/) and restart Steam"
-            )));
-        }
-        Err(e) => return Err(e),
+    let result = match run_bridge_feature(&request.to_json(), options, "launch options").await? {
+        BridgeOutcome::Done(result) => result,
+        BridgeOutcome::Unavailable(why) => return Ok(BridgeOutcome::Unavailable(why)),
     };
     let Some(launch_options) = result.get("launchOptions").and_then(Value::as_str) else {
         return Err(BridgeError::new(format!("{BRIDGE_PLUGIN} sent no launch options in its answer")).into());
@@ -398,6 +412,63 @@ async fn exchange_launch_options(
         launch_options: launch_options.to_string(),
         changed: result.get("changed").and_then(Value::as_bool).unwrap_or(false),
         verified_by_readback: false,
+    }))
+}
+
+/// A non-Steam shortcut edit for the bridge plugin. Fields are as stored in
+/// shortcuts.vdf (exe and start folder quoted, as Steam writes them).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShortcutRequest {
+    Add { name: String, exe: String, start_dir: String, launch_options: String },
+    Remove { appid: i64 },
+}
+
+impl ShortcutRequest {
+    pub fn to_json(&self) -> Value {
+        match self {
+            ShortcutRequest::Add { name, exe, start_dir, launch_options } => json!({
+                "action": "add_shortcut",
+                "name": name,
+                "exe": exe,
+                "startDir": start_dir,
+                "launchOptions": launch_options,
+            }),
+            ShortcutRequest::Remove { appid } => json!({ "action": "remove_shortcut", "appid": appid }),
+        }
+    }
+}
+
+/// A shortcut as the running Steam client holds it: the one added, or the one removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeShortcut {
+    /// Steam picks it when adding.
+    pub appid: i64,
+    pub name: String,
+    pub exe: String,
+    pub start_dir: String,
+    pub launch_options: String,
+}
+
+/// Add or remove a non-Steam shortcut inside the running Steam client.
+/// Unavailable as for [`bridge_launch_options`]; errors are BridgeErrors.
+pub async fn bridge_shortcut(
+    request: &ShortcutRequest,
+    options: &BridgeOptions,
+) -> Result<BridgeOutcome<BridgeShortcut>> {
+    let result = match run_bridge_feature(&request.to_json(), options, "shortcuts").await? {
+        BridgeOutcome::Done(result) => result,
+        BridgeOutcome::Unavailable(why) => return Ok(BridgeOutcome::Unavailable(why)),
+    };
+    let text = |key: &str| result.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let Some(appid) = result.get("appid").and_then(Value::as_i64) else {
+        return Err(BridgeError::new(format!("{BRIDGE_PLUGIN} sent no shortcut appid in its answer")).into());
+    };
+    Ok(BridgeOutcome::Done(BridgeShortcut {
+        appid,
+        name: text("name"),
+        exe: text("exe"),
+        start_dir: text("startDir"),
+        launch_options: text("launchOptions"),
     }))
 }
 
@@ -471,8 +542,10 @@ async fn bridge_exchange(
     }
     .await;
 
-    let response = exchange.map_err(|e| {
-        BridgeError::new(format!("Lost the connection to Millennium ({e}); the edit may or may not have been applied."))
+    let response = exchange.map_err(|e| BridgeError {
+        message: format!("Lost the connection to Millennium ({e}); the edit may or may not have been applied."),
+        timeout: false,
+        outcome_unknown: true,
     })?;
 
     let Some(response) = response else {
@@ -484,13 +557,10 @@ async fn bridge_exchange(
             }
         };
         let _ = tokio::time::timeout(Duration::from_secs(1), withdraw).await;
-        return Err(BridgeError {
-            message: format!(
-                "The {BRIDGE_PLUGIN} Millennium plugin did not answer within {}s; the edit may or may not have been applied.",
-                js_num(options.timeout.as_secs_f64())
-            ),
-            timeout: true,
-        }
+        return Err(BridgeError::timeout(format!(
+            "The {BRIDGE_PLUGIN} Millennium plugin did not answer within {}s; the edit may or may not have been applied.",
+            js_num(options.timeout.as_secs_f64())
+        ))
         .into());
     };
     let _ =
@@ -962,6 +1032,65 @@ mod tests {
         let err = bridge_launch_options(&set, &opts).await.unwrap_err();
         assert!(err.downcast_ref::<BridgeError>().is_some_and(|e| e.timeout), "{err}");
         assert!(err.to_string().contains("doesn't show the new launch options yet"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn shortcut_requests_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options(&dir);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        let fake = Fake {
+            plugin: Some(Arc::new(move |req: Value| {
+                seen_in.lock().unwrap().push(req);
+                Some(json!({ "ok": true, "result": {
+                    "appid": 3000000002u64, "name": "Game", "exe": "\"/g/run\"", "startDir": "\"/g\"", "launchOptions": ""
+                }}))
+            })),
+            ..installed()
+        };
+        let _server = serve(&opts.socket_path, fake);
+
+        let add = ShortcutRequest::Add {
+            name: "Game".into(),
+            exe: "\"/g/run\"".into(),
+            start_dir: "\"/g\"".into(),
+            launch_options: String::new(),
+        };
+        let added = bridge_shortcut(&add, &opts).await.unwrap();
+        assert_eq!(
+            added,
+            BridgeOutcome::Done(BridgeShortcut {
+                appid: 3000000002,
+                name: "Game".into(),
+                exe: "\"/g/run\"".into(),
+                start_dir: "\"/g\"".into(),
+                launch_options: String::new(),
+            })
+        );
+        bridge_shortcut(&ShortcutRequest::Remove { appid: 3000000002 }, &opts).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                json!({ "action": "add_shortcut", "name": "Game", "exe": "\"/g/run\"", "startDir": "\"/g\"", "launchOptions": "" }),
+                json!({ "action": "remove_shortcut", "appid": 3000000002u64 }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_plugin_cannot_edit_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options(&dir);
+        let fake = Fake {
+            plugin: Some(Arc::new(|_| Some(json!({ "ok": false, "error": "Unknown action \"remove_shortcut\"" })))),
+            ..installed()
+        };
+        let _server = serve(&opts.socket_path, fake);
+        match bridge_shortcut(&ShortcutRequest::Remove { appid: 3000000002 }, &opts).await.unwrap() {
+            BridgeOutcome::Unavailable(why) => assert!(why.contains("too old to handle shortcuts"), "{why}"),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
     }
 
     fn rpg() -> Category {
